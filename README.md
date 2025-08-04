@@ -60,7 +60,7 @@ python pitch_corrector.py --input-dir ./vstupni_soubory --output-dir ./vystupni_
 
 1. **Zpracování adresáře s audio soubory:**
 ```bash
-python pitch_corrector.py --input-dir ./samples_in --output-dir ./samples_out_tuned
+python pitch-corrector.py --input-dir ./samples_in --output-dir ./samples_out_tuned
 ```
 
 2. **Zobrazení nápovědy:**
