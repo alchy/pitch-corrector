@@ -60,7 +60,7 @@ python pitch_corrector.py --input-dir ./vstupni_soubory --output-dir ./vystupni_
 
 1. **Zpracování adresáře s audio soubory:**
 ```bash
-python pitch_corrector.py --input-dir ./samples --output-dir ./corrected
+python pitch_corrector.py --input-dir ./samples_in --output-dir ./samples_out_tuned
 ```
 
 2. **Zobrazení nápovědy:**
@@ -140,13 +140,3 @@ Zpracováno: sample001.wav -> m060-C4-DbLvl-023.wav, pitch: 261.63 Hz -> 261.63 
 **"Nelze detekovat platnou frekvenci"**
 - Audio neobsahuje jasně definovanou fundamentální frekvenci nebo je mimo rozsah klavíru
 - Řešení: Ověřte kvalitu nahrávky a přítomnost tónu
-
-### Tipy pro lepší výsledky
-
-1. **Kvalitní nahrávky**: Používejte čisté nahrávky s minimálním šumem
-2. **Jednoduchý obsah**: Nejlepších výsledků dosáhnete s jednotlivými tóny nebo jednoduchými akordy
-3. **Správná hlasitost**: Ani příliš tiché, ani přebuzené nahrávky
-4. **Rozsah klavíru**: Program je optimalizován pro frekvence klavíru
-
-
-[Zde doplňte kontaktní informace]
