@@ -326,12 +326,14 @@ class PitchCorrectorWithVelocityMapping:
 
         for file_path in wav_files:
             print(f"\nZpracovávám: {file_path.name}")
+            print(f"[DEBUG] Čtu soubor: {file_path}")
 
             try:
                 waveform, sr = sf.read(str(file_path))
                 # Ensure waveform is 2D (samples, channels)
                 if len(waveform.shape) == 1:
                     waveform = waveform[:, np.newaxis]
+                print(f"[DEBUG] Úspěšně načten: {waveform.shape[0]} vzorků, {waveform.shape[1]} kanálů, {sr} Hz")
             except Exception as e:
                 print(f"[ERROR] Chyba při načítání {file_path.name}: {e}")
                 continue
@@ -341,11 +343,8 @@ class PitchCorrectorWithVelocityMapping:
                 print(f"[WARNING] Nepodporovaná vzorkovací frekvence {sr} Hz pro {file_path.name}")
                 continue
 
-            # Validate duration
+            # Calculate duration (no limit check)
             duration = len(waveform) / sr
-            if duration > 12:
-                print(f"[WARNING] Soubor {file_path.name} je delší než 12 sekund ({duration:.2f}s)")
-                continue
 
             # Update pitch detector sample rate
             self.pitch_detector.sample_rate = sr
@@ -359,10 +358,22 @@ class PitchCorrectorWithVelocityMapping:
                 continue
 
             midi_float = AudioUtils.freq_to_midi(detected_pitch)
-            midi_int = round(midi_float)
 
-            # Check if correction is within acceptable range (±1 semitone)
-            semitone_diff = midi_float - midi_int
+            # Find nearest MIDI note (not just rounding)
+            midi_lower = int(np.floor(midi_float))
+            midi_upper = int(np.ceil(midi_float))
+
+            # Calculate distances to both notes
+            dist_lower = abs(midi_float - midi_lower)
+            dist_upper = abs(midi_float - midi_upper)
+
+            # Choose the one with smaller correction needed
+            if dist_lower <= dist_upper:
+                midi_int = midi_lower
+                semitone_diff = midi_float - midi_lower
+            else:
+                midi_int = midi_upper
+                semitone_diff = midi_float - midi_upper
             if abs(semitone_diff) > self.max_semitone_shift:
                 print(
                     f"[WARNING] Soubor {file_path.name} vyžaduje korekci {semitone_diff:.2f} půltónů (>±{self.max_semitone_shift}), zahazuji")
@@ -499,14 +510,17 @@ class PitchCorrectorWithVelocityMapping:
 
                 # Generate unique filename
                 output_path = self.generate_unique_filename(midi_note, sample.velocity, sr_suffix)
+                print(f"[DEBUG] Připravuji zápis: {output_path}")
 
                 # Save file
                 try:
                     sf.write(str(output_path), output_waveform, target_sr)
                     print(f"  Uložen: {output_path.name}")
+                    print(f"[DEBUG] Úspěšně zapsán: {output_path} ({len(output_waveform)} vzorků, {target_sr} Hz)")
                     total_outputs += 1
                 except Exception as e:
                     print(f"  [ERROR] Chyba při ukládání {output_path.name}: {e}")
+                    print(f"[DEBUG] Neúspěšný zápis do: {output_path}")
 
         return total_outputs
 
