@@ -1,284 +1,568 @@
 import argparse
-import os
-import torch
-import torchaudio
+import soundfile as sf
 import numpy as np
-
-# Check for librosa availability
-try:
-    import librosa
-    import resampy  # Explicitly check for resampy
-
-    USE_LIBROSA = True
-except ImportError as e:
-    USE_LIBROSA = False
-    print(
-        f"Librosa nebo resampy není k dispozici: {e}. Použiji torchaudio pro pitch shift. Doporučuji 'pip install librosa resampy' pro lepší paměťovou efektivitu.")
-
-# Argument parser with detailed help
-parser = argparse.ArgumentParser(
-    description="""Program pro korekci pitch vstupních WAV souborů na standardní ladění (A4=440 Hz).
-    Zpracovává stereo i mono WAV soubory (44.1 kHz, max. 12 sekund) v zadaném vstupním adresáři.
-    Detekuje fundamentální frekvenci, koriguje ji na nejbližší MIDI notu a ukládá výstup do výstupního adresáře
-    s názvem ve formátu mXXX-NOTA-DbLvl-XX.wav (např. m060-C4-DbLvl-023.wav).
-
-    Příklady použití:
-    1. Zpracování adresáře se soubory:
-       python pitch_corrector.py --input-dir ./vstup --output-dir ./vystup
-       (Zpracuje všechny WAV soubory v adresáři ./vstup a uloží je do ./vystup)
-    2. Spuštění nápovědy:
-       python pitch_corrector.py --help
-    """
-)
-parser.add_argument(
-    '--input-dir',
-    required=True,
-    help="Cesta k adresáři obsahujícímu vstupní WAV soubory (stereo nebo mono, 44.1 kHz, max. 12 sekund)."
-)
-parser.add_argument(
-    '--output-dir',
-    required=True,
-    help="Cesta k adresáři, kam se uloží upravené WAV soubory ve formátu mXXX-NOTA-DbLvl-XX.wav."
-)
-args = parser.parse_args()
-
-# Map MIDI numbers to note names
-MIDI_TO_NOTE = {
-    0: 'C', 1: 'C#', 2: 'D', 3: 'D#', 4: 'E', 5: 'F', 6: 'F#', 7: 'G', 8: 'G#', 9: 'A', 10: 'A#', 11: 'B'
-}
+import resampy
+from collections import defaultdict
+import statistics
+from pathlib import Path
 
 
-def midi_to_note_name(midi):
-    """Convert MIDI number to note name (e.g., 60 -> C4)"""
-    octave = (midi // 12) - 1
-    note_idx = midi % 12
-    note = MIDI_TO_NOTE[note_idx]
-    return f"{note}{octave}"
+class AudioUtils:
+    """Utility functions for audio processing"""
+
+    MIDI_TO_NOTE = {
+        0: 'C', 1: 'C#', 2: 'D', 3: 'D#', 4: 'E', 5: 'F',
+        6: 'F#', 7: 'G', 8: 'G#', 9: 'A', 10: 'A#', 11: 'B'
+    }
+
+    @staticmethod
+    def freq_to_midi(freq):
+        """Convert frequency to MIDI number"""
+        return 12 * np.log2(freq / 440.0) + 69
+
+    @staticmethod
+    def midi_to_freq(midi):
+        """Convert MIDI number to frequency"""
+        return 440.0 * 2 ** ((midi - 69) / 12)
+
+    @staticmethod
+    def midi_to_note_name(midi):
+        """Convert MIDI number to note name (e.g., 60 -> C4)"""
+        octave = (midi // 12) - 1
+        note_idx = midi % 12
+        note = AudioUtils.MIDI_TO_NOTE[note_idx]
+        if len(note) == 1:
+            note += '_'  # Pad single characters for consistent formatting
+        return f"{note}{octave}"
+
+    @staticmethod
+    def calculate_rms_db(waveform):
+        """Calculate RMS loudness in dB"""
+        rms = np.sqrt(np.mean(waveform ** 2))
+        return 20 * np.log10(rms + 1e-10)
+
+    @staticmethod
+    def normalize_audio(waveform, target_db=-20.0):
+        """Normalize audio to target dB level"""
+        rms = np.sqrt(np.mean(waveform ** 2))
+        target_rms = 10 ** (target_db / 20)
+        return waveform * (target_rms / (rms + 1e-10))
 
 
-def freq_to_midi(freq):
-    """Convert frequency to MIDI number"""
-    return 12 * np.log2(freq / 440.0) + 69
+class YINPitchDetector:
+    """YIN pitch detection algorithm - optimized for piano samples"""
 
+    def __init__(self, sample_rate=44100, downsample_factor=1):
+        self.sample_rate = sample_rate
+        self.downsample_factor = downsample_factor
+        self.min_duration = 0.1
+        self.fmin = 32.0  # Piano range: A0 ≈ 27.5 Hz
+        self.fmax = 4186.0  # Piano range: C8 ≈ 4186 Hz
+        self.threshold = 0.1
+        self.frame_length = 2048
+        self.hop_size = 512
 
-def midi_to_freq(midi):
-    """Convert MIDI number to frequency"""
-    return 440.0 * 2 ** ((midi - 69) / 12)
+    def preprocess(self, waveform):
+        """Preprocess waveform for pitch detection"""
+        # Convert to mono if stereo
+        if len(waveform.shape) > 1 and waveform.shape[1] > 1:
+            waveform = np.mean(waveform, axis=1)
+        elif len(waveform.shape) > 1:
+            waveform = waveform[:, 0]  # Take first channel if already mono
 
+        # Normalize to consistent level
+        return AudioUtils.normalize_audio(waveform, target_db=-20.0)
 
-def calculate_rms_db(waveform):
-    """Calculate RMS loudness in dB, handles mono/stereo"""
-    rms = torch.sqrt(torch.mean(waveform ** 2))
-    return 20 * torch.log10(rms + 1e-10).item()
-
-
-def normalize_audio(waveform, target_db=-20):
-    """Normalize audio to target dB level for better pitch detection"""
-    current_rms = torch.sqrt(torch.mean(waveform ** 2))
-    target_rms = 10 ** (target_db / 20)
-    scaling_factor = target_rms / (current_rms + 1e-10)
-    return waveform * scaling_factor
-
-
-def preprocess_for_pitch_detection(waveform, sr):
-    """Preprocess audio for better pitch detection"""
-    # Convert to mono by averaging channels if stereo
-    if waveform.shape[0] > 1:
-        mono_waveform = torch.mean(waveform, dim=0, keepdim=True)
-    else:
-        mono_waveform = waveform
-
-    # Normalize to consistent level
-    normalized = normalize_audio(mono_waveform, target_db=-20)
-
-    # Apply high-pass filter to remove low-frequency noise
-    # Simple high-pass filter using first-order difference
-    filtered = torch.zeros_like(normalized)
-    filtered[:, 1:] = normalized[:, 1:] - 0.95 * normalized[:, :-1]
-
-    return filtered
-
-
-def detect_pitch_improved(waveform, sr):
-    """Improved pitch detection with preprocessing and multiple methods"""
-    # Piano frequency range: A0 (27.5 Hz) to C8 (4186 Hz)
-    # Adding some margin for detection accuracy
-    PIANO_MIN_FREQ = 25.0  # A0 = 27.5 Hz with margin
-    PIANO_MAX_FREQ = 4400.0  # C8 = 4186 Hz with margin
-
-    # Preprocess audio
-    processed = preprocess_for_pitch_detection(waveform, sr)
-
-    try:
-        # Method 1: Torchaudio's built-in detector
-        pitch_frames = torchaudio.functional.detect_pitch_frequency(processed, sr)
-        valid_pitches = pitch_frames[pitch_frames > 0]
-
-        if len(valid_pitches) > 0:
-            # Use median instead of mean for more robust estimation
-            median_pitch = torch.median(valid_pitches).item()
-
-            # Additional validation: check if pitch is in piano range
-            if PIANO_MIN_FREQ <= median_pitch <= PIANO_MAX_FREQ:
-                return median_pitch
-
-    except Exception as e:
-        print(f"Chyba v torchaudio detekci: {e}")
-
-    # Method 2: Autocorrelation-based detection (fallback)
-    try:
-        if USE_LIBROSA:
-            audio_np = processed.numpy().flatten()
-            # Use librosa's pitch detection with piano frequency range
-            pitches, magnitudes = librosa.piptrack(y=audio_np, sr=sr,
-                                                   threshold=0.1,
-                                                   fmin=PIANO_MIN_FREQ,
-                                                   fmax=PIANO_MAX_FREQ)
-
-            # Find the pitch with highest magnitude in each frame
-            pitch_values = []
-            for frame in range(pitches.shape[1]):
-                idx = magnitudes[:, frame].argmax()
-                pitch = pitches[idx, frame]
-                if pitch > 0:
-                    pitch_values.append(pitch)
-
-            if pitch_values:
-                return np.median(pitch_values)
-
-    except Exception as e:
-        print(f"Chyba v librosa detekci: {e}")
-
-    # Method 3: Simple autocorrelation fallback
-    try:
-        audio_flat = processed.flatten()
-
-        # Autocorrelation
-        autocorr = torch.nn.functional.conv1d(
-            audio_flat.unsqueeze(0).unsqueeze(0),
-            audio_flat.flip(0).unsqueeze(0).unsqueeze(0),
-            padding=len(audio_flat) - 1
-        ).squeeze()
-
-        # Find peak in piano frequency range
-        min_period = int(sr / PIANO_MAX_FREQ)  # Max frequency
-        max_period = int(sr / PIANO_MIN_FREQ)  # Min frequency
-
-        autocorr_section = autocorr[len(audio_flat):len(audio_flat) + max_period]
-        peak_idx = torch.argmax(autocorr_section[min_period:]) + min_period
-
-        fundamental_freq = sr / peak_idx.item()
-
-        if PIANO_MIN_FREQ <= fundamental_freq <= PIANO_MAX_FREQ:
-            return fundamental_freq
-
-    except Exception as e:
-        print(f"Chyba v autocorrelation detekci: {e}")
-
-    return None
-
-
-# Process files
-input_dir = args.input_dir
-output_dir = args.output_dir
-os.makedirs(output_dir, exist_ok=True)
-
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-print(f"Používám zařízení: {device}")
-
-for file_name in os.listdir(input_dir):
-    if not file_name.endswith('.wav'):
-        continue
-
-    # Normalize file path for Windows
-    input_path = os.path.abspath(os.path.join(input_dir, file_name)).replace("\\", "/")
-    print(f"Zpracovávám {file_name}")
-
-    # Load file
-    try:
-        waveform, sr = torchaudio.load(input_path)
-        original_waveform = waveform.clone()  # Keep original for processing
-    except Exception as e:
-        print(f"Chyba při načítání {file_name}: {e}")
-        continue
-
-    # Validate file
-    if sr != 44100:
-        print(f"Soubor {file_name} má neplatnou vzorkovací frekvenci {sr} Hz, očekáváno 44100 Hz")
-        continue
-    if waveform.shape[1] / sr > 12:
-        print(f"Soubor {file_name} je delší než 12 sekund")
-        continue
-
-    # Detect mono/stereo
-    num_channels = waveform.shape[0]
-    audio_format = 'stereo' if num_channels == 2 else 'mono'
-    print(f"Formát: {audio_format}")
-
-    # Detect fundamental frequency with improved method
-    mean_pitch = detect_pitch_improved(waveform, sr)
-
-    if mean_pitch is None:
-        print(f"Nelze detekovat platnou frekvenci pro {file_name}, přeskočeno")
-        continue
-
-    print(f"Detekovaná frekvence: {mean_pitch:.2f} Hz")
-
-    # Convert to MIDI and round to nearest note
-    midi_float = freq_to_midi(mean_pitch)
-    midi_int = round(midi_float)
-    target_freq = midi_to_freq(midi_int)
-    semitone_shift = 12 * np.log2(target_freq / mean_pitch)
-
-    print(f"MIDI: {midi_float:.2f} -> {midi_int}, posun: {semitone_shift:.3f} půltónů")
-
-    # Apply pitch shift
-    if abs(semitone_shift) > 0.01:
-        try:
-            if USE_LIBROSA:
-                # Librosa for lower memory usage
-                waveform_np = original_waveform.numpy()
-                shifted_channels = []
-                for ch in range(num_channels):
-                    ch_data = waveform_np[ch]
-                    shifted = librosa.effects.pitch_shift(
-                        y=ch_data, sr=sr, n_steps=semitone_shift, bins_per_octave=12, res_type='kaiser_fast'
-                    )
-                    shifted_channels.append(shifted)
-                waveform = torch.from_numpy(np.array(shifted_channels)).float()
+    def yin_difference_function(self, audio, max_tau):
+        """YIN difference function"""
+        diff = np.zeros(max_tau)
+        for tau in range(max_tau):
+            if tau == 0:
+                diff[tau] = 0
             else:
-                # Fallback to torchaudio with optimized parameters
-                waveform = original_waveform.to(device)
-                transform = torchaudio.transforms.PitchShift(
-                    sample_rate=sr, n_steps=semitone_shift, n_fft=512, hop_length=256
-                )
-                waveform = transform(waveform)
-                waveform = waveform.to('cpu')
+                diff[tau] = np.sum((audio[:len(audio) - tau] - audio[tau:]) ** 2)
+        return diff
+
+    def yin_cmndf(self, diff, max_tau):
+        """YIN cumulative mean normalized difference function"""
+        cmndf = np.zeros(max_tau)
+        cmndf[0] = 1.0
+        cumsum = 0.0
+
+        for tau in range(1, max_tau):
+            cumsum += diff[tau]
+            if cumsum == 0:
+                cmndf[tau] = 1.0
+            else:
+                cmndf[tau] = diff[tau] * tau / cumsum
+
+        return cmndf
+
+    def yin_parabolic_interpolation(self, cmndf, tau):
+        """Parabolic interpolation for sub-sample accuracy"""
+        if tau <= 0 or tau >= len(cmndf) - 1:
+            return tau
+
+        left = cmndf[tau - 1]
+        center = cmndf[tau]
+        right = cmndf[tau + 1]
+
+        # Parabolic interpolation formula
+        denom = 2 * (left - 2 * center + right)
+        if abs(denom) < 1e-10:
+            return tau
+
+        delta = (left - right) / denom
+        return tau + delta / 2
+
+    def yin_pitch_single_frame(self, audio, effective_sr):
+        """YIN pitch detection for single frame"""
+        max_tau = min(len(audio) - 1, int(effective_sr / self.fmin))
+        min_tau = max(1, int(effective_sr / self.fmax))
+
+        if max_tau <= min_tau:
+            return None
+
+        # Compute difference function
+        diff = self.yin_difference_function(audio, max_tau)
+
+        # Compute CMNDF
+        cmndf = self.yin_cmndf(diff, max_tau)
+
+        # Find first minimum below threshold
+        for tau in range(min_tau, max_tau):
+            if cmndf[tau] < self.threshold:
+                # Use parabolic interpolation for better accuracy
+                tau_interp = self.yin_parabolic_interpolation(cmndf, tau)
+                if tau_interp <= 0:
+                    continue
+                return effective_sr / tau_interp
+
+        return None
+
+    def detect(self, waveform, verbose=False):
+        """Main pitch detection method"""
+        duration = len(waveform) / self.sample_rate
+        if duration < self.min_duration:
+            if verbose:
+                print(f"[DEBUG] Signál je příliš krátký ({duration:.3f}s)")
+            return None
+
+        # Preprocess audio
+        audio = self.preprocess(waveform)
+
+        # Apply downsampling if requested
+        effective_sr = self.sample_rate
+        if self.downsample_factor > 1:
+            if verbose:
+                print(f"[DEBUG] Downsampling: faktor {self.downsample_factor}")
+            audio = resampy.resample(audio, self.sample_rate, self.sample_rate // self.downsample_factor)
+            effective_sr = self.sample_rate // self.downsample_factor
+
+        try:
+            pitches = []
+
+            # Analyze multiple frames for stability
+            for i in range(0, len(audio) - self.frame_length, self.hop_size):
+                frame = audio[i:i + self.frame_length]
+                pitch = self.yin_pitch_single_frame(frame, effective_sr)
+
+                if pitch is not None and self.fmin <= pitch <= self.fmax:
+                    # Compensate for downsampling
+                    compensated_pitch = pitch * self.downsample_factor
+                    pitches.append(compensated_pitch)
+
+            if not pitches:
+                if verbose:
+                    print("[DEBUG] Žádné validní frekvence nebyly detekovány.")
+                return None
+
+            # Use median for robustness
+            median_pitch = np.median(pitches)
+
+            if verbose:
+                print(f"[DEBUG] YIN detekce: {len(pitches)} validních framů")
+                print(f"[DEBUG] Detekovaný pitch: {median_pitch:.2f} Hz")
+
+            return median_pitch
+
         except Exception as e:
-            print(f"Chyba při pitch shift pro {file_name}: {e}")
-            continue
-    else:
-        waveform = original_waveform
-        print("Žádný pitch shift není potřeba")
+            if verbose:
+                print(f"[DEBUG] Chyba v YIN detekci: {e}")
+            return None
 
-    # Preserve original loudness
-    original_rms = torch.sqrt(torch.mean(original_waveform ** 2))
-    current_rms = torch.sqrt(torch.mean(waveform ** 2))
-    waveform = waveform / (current_rms + 1e-10) * original_rms
 
-    # Calculate loudness for file name
-    db_level = round(calculate_rms_db(waveform))
+class SimplePitchShifter:
+    """Simple pitch shifting via resampling (changes duration)"""
 
-    # Create output file name
-    note_name = midi_to_note_name(midi_int)
-    output_file = f"m{midi_int:03d}-{note_name}-DbLvl{db_level:+03d}.wav"
-    output_path = os.path.join(output_dir, output_file).replace("\\", "/")
+    @staticmethod
+    def pitch_shift_simple(audio, sr, semitone_shift):
+        """Pitch shift změnou sample rate (mění délku)"""
+        if abs(semitone_shift) < 0.01:
+            return audio, sr
 
-    # Save output
-    try:
-        torchaudio.save(output_path, waveform, sr)
-        print(
-            f"Zpracováno: {file_name} -> {output_file}, pitch: {mean_pitch:.2f} Hz -> {target_freq:.2f} Hz, {audio_format}")
-        print("-" * 50)
-    except Exception as e:
-        print(f"Chyba při ukládání {output_file}: {e}")
+        factor = 2 ** (semitone_shift / 12)
+        new_sr = int(sr * factor)
+
+        try:
+            # Handle multi-channel audio
+            if len(audio.shape) > 1:
+                shifted_channels = []
+                for ch in range(audio.shape[1]):
+                    shifted = resampy.resample(audio[:, ch], sr, new_sr)
+                    shifted_channels.append(shifted)
+                shifted_audio = np.column_stack(shifted_channels)
+            else:
+                shifted_audio = resampy.resample(audio, sr, new_sr)
+
+            return shifted_audio, new_sr
+
+        except Exception as e:
+            print(f"[ERROR] Chyba při pitch shift: {e}")
+            return audio, sr
+
+
+class VelocityMapper:
+    """Handles velocity mapping and outlier filtering"""
+
+    @staticmethod
+    def remove_outliers(rms_values, threshold_db=8.0):
+        """Remove outliers based on median absolute deviation"""
+        if len(rms_values) < 3:
+            return rms_values
+
+        median_rms = statistics.median(rms_values)
+        filtered_values = []
+
+        for rms in rms_values:
+            if abs(rms - median_rms) <= threshold_db:
+                filtered_values.append(rms)
+
+        return filtered_values if filtered_values else rms_values
+
+    @staticmethod
+    def create_velocity_mapping(rms_values):
+        """Create linear velocity mapping (0-7) from RMS values"""
+        if len(rms_values) <= 1:
+            return {0: rms_values}
+
+        min_rms = min(rms_values)
+        max_rms = max(rms_values)
+
+        # Handle case where all values are very similar
+        if abs(max_rms - min_rms) < 0.1:
+            return {0: rms_values}
+
+        # Linear mapping to velocity 0-7
+        velocity_map = defaultdict(list)
+
+        for rms in rms_values:
+            if max_rms == min_rms:
+                velocity = 0
+            else:
+                velocity = round(7 * (rms - min_rms) / (max_rms - min_rms))
+                velocity = max(0, min(7, velocity))
+
+            velocity_map[velocity].append(rms)
+
+        return dict(velocity_map)
+
+
+class AudioSample:
+    """Container for audio sample data"""
+
+    def __init__(self, filepath, waveform, sr, rms_db, midi_note):
+        self.filepath = filepath
+        self.waveform = waveform
+        self.sr = sr
+        self.rms_db = rms_db
+        self.midi_note = midi_note
+        self.velocity = None
+
+
+class PitchCorrectorWithVelocityMapping:
+    """Main processor class"""
+
+    def __init__(self, input_dir, output_dir, outlier_threshold=8.0, verbose=False):
+        self.input_dir = Path(input_dir)
+        self.output_dir = Path(output_dir)
+        self.outlier_threshold = outlier_threshold
+        self.verbose = verbose
+        self.max_semitone_shift = 1.0  # Maximum ±1 semitone
+
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Initialize components
+        self.pitch_detector = YINPitchDetector()
+        self.pitch_shifter = SimplePitchShifter()
+        self.velocity_mapper = VelocityMapper()
+
+    def generate_unique_filename(self, midi, velocity, sample_rate_str):
+        """Generate unique filename with -next1, -next2, etc."""
+        base_filename = f"m{midi:03d}-vel{velocity}-{sample_rate_str}"
+        output_path = self.output_dir / f"{base_filename}.wav"
+
+        if not output_path.exists():
+            return output_path
+
+        counter = 1
+        while True:
+            filename = f"{base_filename}-next{counter}.wav"
+            output_path = self.output_dir / filename
+            if not output_path.exists():
+                return output_path
+            counter += 1
+
+    def load_and_analyze_files(self):
+        """Phase 1: Load and analyze all files"""
+        print("\n=== FÁZE 1: Načítání a analýza souborů ===")
+        samples = []
+
+        wav_files = list(self.input_dir.glob("*.wav")) + list(self.input_dir.glob("*.WAV"))
+
+        if not wav_files:
+            print("Nebyly nalezeny žádné WAV soubory!")
+            return samples
+
+        for file_path in wav_files:
+            print(f"\nZpracovávám: {file_path.name}")
+
+            try:
+                waveform, sr = sf.read(str(file_path))
+                # Ensure waveform is 2D (samples, channels)
+                if len(waveform.shape) == 1:
+                    waveform = waveform[:, np.newaxis]
+            except Exception as e:
+                print(f"[ERROR] Chyba při načítání {file_path.name}: {e}")
+                continue
+
+            # Validate sample rate
+            if sr not in [44100, 48000]:
+                print(f"[WARNING] Nepodporovaná vzorkovací frekvence {sr} Hz pro {file_path.name}")
+                continue
+
+            # Validate duration
+            duration = len(waveform) / sr
+            if duration > 12:
+                print(f"[WARNING] Soubor {file_path.name} je delší než 12 sekund ({duration:.2f}s)")
+                continue
+
+            # Update pitch detector sample rate
+            self.pitch_detector.sample_rate = sr
+
+            # Detect pitch using YIN (convert to 1D for detection)
+            waveform_1d = waveform[:, 0] if waveform.shape[1] > 1 else waveform.flatten()
+            detected_pitch = self.pitch_detector.detect(waveform_1d, verbose=self.verbose)
+
+            if detected_pitch is None:
+                print(f"[WARNING] Nelze detekovat pitch pro {file_path.name}")
+                continue
+
+            midi_float = AudioUtils.freq_to_midi(detected_pitch)
+            midi_int = round(midi_float)
+
+            # Check if correction is within acceptable range (±1 semitone)
+            semitone_diff = midi_float - midi_int
+            if abs(semitone_diff) > self.max_semitone_shift:
+                print(
+                    f"[WARNING] Soubor {file_path.name} vyžaduje korekci {semitone_diff:.2f} půltónů (>±{self.max_semitone_shift}), zahazuji")
+                continue
+
+            # Calculate RMS
+            rms_db = AudioUtils.calculate_rms_db(waveform)
+
+            sample = AudioSample(file_path, waveform, sr, rms_db, midi_int)
+            samples.append(sample)
+
+            note_name = AudioUtils.midi_to_note_name(midi_int)
+            print(f"  Pitch: {detected_pitch:.2f} Hz → MIDI {midi_int} ({note_name})")
+            print(f"  Korekce: {semitone_diff:.3f} půltónů")
+            print(f"  RMS: {rms_db:.2f} dB, SR: {sr} Hz, délka: {duration:.2f}s")
+
+        print(f"\nCelkem načteno {len(samples)} zpracovatelných vzorků")
+        return samples
+
+    def create_velocity_mappings(self, samples):
+        """Phase 2: Create velocity mappings per MIDI note"""
+        print("\n=== FÁZE 2: Tvorba velocity map ===")
+
+        # Group samples by MIDI note
+        midi_groups = defaultdict(list)
+        for sample in samples:
+            midi_groups[sample.midi_note].append(sample)
+
+        velocity_mappings = {}
+
+        for midi_note, midi_samples in midi_groups.items():
+            note_name = AudioUtils.midi_to_note_name(midi_note)
+            rms_values = [s.rms_db for s in midi_samples]
+
+            print(f"\nMIDI {midi_note} ({note_name}): {len(midi_samples)} vzorků")
+            print(f"  RMS rozsah: {min(rms_values):.2f} až {max(rms_values):.2f} dB")
+
+            # Remove outliers
+            filtered_rms = self.velocity_mapper.remove_outliers(rms_values, self.outlier_threshold)
+            outliers_removed = len(rms_values) - len(filtered_rms)
+
+            if outliers_removed > 0:
+                print(f"  Odstraněno {outliers_removed} outlierů")
+
+            # Create velocity mapping
+            velocity_map = self.velocity_mapper.create_velocity_mapping(filtered_rms)
+            velocity_mappings[midi_note] = velocity_map
+
+            # Assign velocity to samples
+            for sample in midi_samples:
+                sample.velocity = None
+                for vel, rms_list in velocity_map.items():
+                    if sample.rms_db in rms_list:
+                        sample.velocity = vel
+                        break
+
+            print(f"  Velocity mapping:")
+            for vel, rms_list in sorted(velocity_map.items()):
+                print(f"    vel{vel}: {len(rms_list)} vzorků (RMS {min(rms_list):.1f} až {max(rms_list):.1f} dB)")
+
+        return velocity_mappings
+
+    def process_and_export(self, samples):
+        """Phase 3: Process and export files"""
+        print("\n=== FÁZE 3: Tuning a export ===")
+
+        total_outputs = 0
+
+        for sample in samples:
+            if sample.velocity is None:
+                continue  # Skip outliers
+
+            midi_note = sample.midi_note
+            note_name = AudioUtils.midi_to_note_name(midi_note)
+
+            print(f"\nZpracovávám: {sample.filepath.name}")
+            print(f"  MIDI {midi_note} ({note_name}) → velocity {sample.velocity}")
+
+            # Pitch correction
+            target_freq = AudioUtils.midi_to_freq(midi_note)
+
+            # Re-detect pitch for accurate correction
+            waveform_1d = sample.waveform[:, 0] if sample.waveform.shape[1] > 1 else sample.waveform.flatten()
+            detected_pitch = self.pitch_detector.detect(waveform_1d, verbose=False)
+
+            if detected_pitch:
+                semitone_shift = 12 * np.log2(target_freq / detected_pitch)
+
+                # Double-check shift limit
+                if abs(semitone_shift) > self.max_semitone_shift:
+                    print(f"  [WARNING] Korekce {semitone_shift:.3f} půltónů překračuje limit, přeskakuji")
+                    continue
+
+                print(f"  Pitch korekce: {detected_pitch:.2f} Hz → {target_freq:.2f} Hz ({semitone_shift:.3f} půltónů)")
+
+                # Apply simple pitch shift (changes duration)
+                tuned_waveform, tuned_sr = self.pitch_shifter.pitch_shift_simple(
+                    sample.waveform, sample.sr, semitone_shift
+                )
+
+                # Calculate new duration
+                original_duration = len(sample.waveform) / sample.sr
+                new_duration = len(tuned_waveform) / tuned_sr
+                print(f"  Délka: {original_duration:.3f}s → {new_duration:.3f}s")
+
+            else:
+                tuned_waveform = sample.waveform
+                tuned_sr = sample.sr
+                print(f"  Bez pitch korekce (re-detection failed)")
+
+            # Generate outputs for both target sample rates
+            target_sample_rates = [(44100, 'f44'), (48000, 'f48')]
+
+            for target_sr, sr_suffix in target_sample_rates:
+                # Convert sample rate if needed
+                if tuned_sr != target_sr:
+                    try:
+                        if len(tuned_waveform.shape) > 1 and tuned_waveform.shape[1] > 1:
+                            # Multi-channel
+                            converted_channels = []
+                            for ch in range(tuned_waveform.shape[1]):
+                                converted = resampy.resample(tuned_waveform[:, ch], tuned_sr, target_sr)
+                                converted_channels.append(converted)
+                            output_waveform = np.column_stack(converted_channels)
+                        else:
+                            # Mono
+                            output_waveform = resampy.resample(tuned_waveform.flatten(), tuned_sr, target_sr)
+                            output_waveform = output_waveform[:, np.newaxis]
+                    except Exception as e:
+                        print(f"  [ERROR] Chyba při konverzi sample rate: {e}")
+                        continue
+                else:
+                    output_waveform = tuned_waveform
+
+                # Generate unique filename
+                output_path = self.generate_unique_filename(midi_note, sample.velocity, sr_suffix)
+
+                # Save file
+                try:
+                    sf.write(str(output_path), output_waveform, target_sr)
+                    print(f"  Uložen: {output_path.name}")
+                    total_outputs += 1
+                except Exception as e:
+                    print(f"  [ERROR] Chyba při ukládání {output_path.name}: {e}")
+
+        return total_outputs
+
+    def process_all(self):
+        """Main processing pipeline"""
+        print(f"Vstupní adresář: {self.input_dir}")
+        print(f"Výstupní adresář: {self.output_dir}")
+        print(f"Outlier threshold: {self.outlier_threshold} dB")
+        print(f"Max pitch korekce: ±{self.max_semitone_shift} půltónů")
+
+        # Phase 1: Load and analyze
+        samples = self.load_and_analyze_files()
+        if not samples:
+            return
+
+        # Phase 2: Create velocity mappings
+        velocity_mappings = self.create_velocity_mappings(samples)
+
+        # Phase 3: Process and export
+        total_outputs = self.process_and_export(samples)
+
+        print(f"\n=== DOKONČENO ===")
+        print(f"Celkem vytvořeno {total_outputs} výstupních souborů")
+        print(f"Výstupní adresář: {self.output_dir}")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="""Program pro korekci pitch a velocity mapping s YIN algoritmem a jednoduchým pitch shiftem.
+        Zpracovává WAV soubory (44.1 kHz a 48 kHz) s maximální korekcí ±1 půltón.
+        Vytváří velocity mapy (0-7) podle RMS hlasitosti pro každou MIDI notu.
+        Ukládá výstup v obou formátech s názvem ve formátu mXXX-velY-fZZ.wav.
+        """,
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+
+    parser.add_argument('--input-dir', required=True,
+                        help='Cesta k adresáři s vstupními WAV soubory')
+    parser.add_argument('--output-dir', required=True,
+                        help='Cesta k výstupnímu adresáři')
+    parser.add_argument('--outlier-threshold', type=float, default=8.0,
+                        help='Práh pro odstranění outlierů v dB (výchozí: 8.0)')
+    parser.add_argument('--verbose', action='store_true',
+                        help='Podrobný výstup pro debugging')
+
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+
+    corrector = PitchCorrectorWithVelocityMapping(
+        input_dir=args.input_dir,
+        output_dir=args.output_dir,
+        outlier_threshold=args.outlier_threshold,
+        verbose=args.verbose
+    )
+
+    corrector.process_all()
