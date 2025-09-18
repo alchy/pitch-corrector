@@ -1,8 +1,8 @@
 """
 Program pro korekci pitch a velocity mapping vzorků hudebních nástrojů
-s pokročilou YIN detekcí a adaptivní oktávovou korekcí.
+s pokročilou YIN detekcí, globálním velocity mappingem a adaptivní oktávovou korekcí.
 
-Autor: Refaktorovaná verze pro obecné hudební nástroje
+Autor: Refaktorovaná verze s globálním velocity mappingem
 Datum: 2025
 """
 
@@ -24,7 +24,7 @@ logger.setLevel(logging.INFO)
 
 # Vypnutí progress bar při verbose režimu pro lepší čitelnost
 class ProgressManager:
-    """Správce progress barů a výstupu"""
+    """Správce progress barů a výstupu s vylepšeným formátováním"""
 
     def __init__(self, verbose=False):
         self.verbose = verbose
@@ -67,8 +67,33 @@ class ProgressManager:
             tqdm.write(title)
             tqdm.write(separator)
 
+    def file_info(self, filename):
+        """Informace o zpracovávaném souboru s čistým formátováním"""
+        if self.verbose:
+            print(f"\n--- Zpracovávám: {filename} ---")
+        else:
+            # Vynutit nový řádek a ukončit progress bar řádek
+            print(f"\nZpracovávám: {filename}", flush=True)
+
+    def file_details(self, details_lines):
+        """Detaily o souboru - seznam řádků"""
+        for line in details_lines:
+            if self.verbose:
+                print(line)
+            else:
+                print(line, flush=True)  # Použij print místo tqdm.write
+
+    def final_summary(self, message):
+        """Finální shrnutí s čistým formátováním"""
+        if self.verbose:
+            print(f"\n{message}")
+        else:
+            print()  # Prázdný řádek
+            tqdm.write(message)
+
+
 class AudioUtils:
-    """Pomocné funkce pro práci s audio daty"""
+    """Pomocné funkce pro práci s audio daty - rozšířené o peak detection"""
 
     MIDI_TO_NOTE = {
         0: 'C', 1: 'C#', 2: 'D', 3: 'D#', 4: 'E', 5: 'F',
@@ -111,6 +136,43 @@ class AudioUtils:
         if rms == 0:
             return -np.inf
         return 20 * np.log10(rms)
+
+    @staticmethod
+    def calculate_peak_db(waveform):
+        """Výpočet peak amplitudy v dB - lepší pro velocity detection"""
+        # Flatten pro multi-channel audio
+        if len(waveform.shape) > 1:
+            waveform = waveform.flatten()
+
+        peak = np.max(np.abs(waveform))
+        if peak == 0:
+            return -np.inf
+        return 20 * np.log10(peak)
+
+    @staticmethod
+    def calculate_attack_peak_db(waveform, sr, attack_duration=0.5):
+        """
+        Výpočet peak amplitudy pouze v attack fázi vzorku.
+        attack_duration: délka attack fáze v sekundách (výchozí 500ms)
+        """
+        # Flatten pro multi-channel audio
+        if len(waveform.shape) > 1:
+            waveform = waveform.flatten()
+
+        # Výpočet počtu vzorků pro attack fázi
+        attack_samples = int(sr * attack_duration)
+        attack_samples = min(attack_samples, len(waveform))
+
+        if attack_samples <= 0:
+            return AudioUtils.calculate_peak_db(waveform)
+
+        # Analýza pouze attack části
+        attack_section = waveform[:attack_samples]
+        peak = np.max(np.abs(attack_section))
+
+        if peak == 0:
+            return -np.inf
+        return 20 * np.log10(peak)
 
     @staticmethod
     def normalize_audio(waveform, target_db=-20.0):
@@ -487,57 +549,138 @@ class SimplePitchShifter:
 
 
 class VelocityMapper:
-    """Správa velocity mappingu na základě seskupování podobných RMS hodnot"""
+    """Správa globální velocity mapy na základě peak detection všech vzorků"""
 
     @staticmethod
-    def create_velocity_mapping(rms_values, grouping_threshold=1.5):
+    def create_global_velocity_mapping(all_peak_values, target_velocities=8):
         """
-        Vytvoření velocity mappingu (0-7) z RMS hodnot na základě seskupování.
-        - Seřadí RMS hodnoty vzestupně.
-        - Vytváří skupiny s max rozdílem 2 * grouping_threshold (např. 3 dB).
-        - Přiřadí velocity 0 (nejtišší) až 7 (nejsilnější), max 8 skupin.
-        - Pokud by skupin bylo více než 8, vyřadí extrémní vzorky.
-        - Vzorky mimo skupiny dostanou None.
+        Vytvoření globální velocity mapy ze všech peak hodnot napříč všemi notami.
+        Rozdělí celý rozsah od nejslabšího po nejsilnější vzorek do 8 skupin.
+
+        Args:
+            all_peak_values: List všech peak hodnot v dB ze všech vzorků
+            target_velocities: Počet cílových velocity skupin (výchozí 8 pro 0-7)
+
+        Returns:
+            tuple: (velocity_thresholds, min_peak, max_peak)
+                - velocity_thresholds: List hranic pro jednotlivé velocity (0-7)
+                - min_peak, max_peak: Celkový rozsah nahrávky
         """
-        if len(rms_values) <= 1:
-            return {0: list(rms_values)}
+        if len(all_peak_values) <= 1:
+            return [all_peak_values[0]] * target_velocities, all_peak_values[0], all_peak_values[0]
 
-        # Seřazení RMS hodnot vzestupně (od nejtišší po nejsilnější)
-        sorted_rms = sorted(rms_values)
+        # Seřazení všech peak hodnot
+        sorted_peaks = sorted(all_peak_values)
+        min_peak = min(sorted_peaks)
+        max_peak = max(sorted_peaks)
+        peak_range = max_peak - min_peak
 
-        velocity_map = defaultdict(list)
-        current_group_min = sorted_rms[0]
-        current_velocity = 0
+        # Pokud je rozsah příliš malý, všechny vzorky do jedné skupiny
+        if peak_range < 1.0:  # Méně než 1 dB rozdíl
+            return [min_peak] * target_velocities, min_peak, max_peak
 
-        for rms in sorted_rms:
-            if abs(rms - current_group_min) <= 2 * grouping_threshold:
-                # Vzorek spadá do aktuální skupiny
-                velocity_map[current_velocity].append(rms)
+        # Vytvoření hranic pro velocity skupiny
+        # Rovnoměrné rozdělení celého rozsahu
+        step = peak_range / target_velocities
+        velocity_thresholds = []
+
+        for i in range(target_velocities):
+            threshold = min_peak + (i * step)
+            velocity_thresholds.append(threshold)
+
+        return velocity_thresholds, min_peak, max_peak
+
+    @staticmethod
+    def assign_velocity_from_global_map(peak_value, velocity_thresholds, max_velocity=7):
+        """
+        Přiřadí velocity na základě globální velocity mapy.
+
+        Args:
+            peak_value: Peak hodnota vzorku v dB
+            velocity_thresholds: List hranic velocity ze create_global_velocity_mapping
+            max_velocity: Maximální velocity (výchozí 7)
+
+        Returns:
+            int: Velocity 0-7
+        """
+        # Najdi nejvyšší práh, který je stále menší nebo roven peak_value
+        velocity = 0
+        for i, threshold in enumerate(velocity_thresholds):
+            if peak_value >= threshold:
+                velocity = i
             else:
-                # Vytvoření nové skupiny, pokud je méně než 8
-                if current_velocity < 7:
-                    current_velocity += 1
-                    current_group_min = rms
-                    velocity_map[current_velocity].append(rms)
-                else:
-                    # Překročen limit 8 skupin - vyřadit vzorek (None)
-                    pass  # Extrémní vzorek se nezařadí
+                break
 
-        # Pokud skupin je méně než 8, je to OK
-        return dict(velocity_map)
+        # Omez na maximální velocity
+        return min(velocity, max_velocity)
+
+    @staticmethod
+    def create_velocity_mapping_statistics(samples, velocity_thresholds, min_peak, max_peak):
+        """
+        Vytvoří statistiky pro globální velocity mapping.
+
+        Args:
+            samples: List všech AudioSample objektů
+            velocity_thresholds: Hranice velocity
+            min_peak, max_peak: Rozsah peak hodnot
+
+        Returns:
+            dict: Statistiky velocity mappingu
+        """
+        # Seskupení vzorků podle přiřazené velocity
+        velocity_stats = defaultdict(list)
+        midi_velocity_stats = defaultdict(lambda: defaultdict(list))
+
+        for sample in samples:
+            if sample.velocity is not None:
+                velocity_stats[sample.velocity].append(sample.attack_peak_db)
+                midi_velocity_stats[sample.midi_note][sample.velocity].append(sample.attack_peak_db)
+
+        # Celkové statistiky
+        global_stats = {
+            'total_range_db': max_peak - min_peak,
+            'min_peak_db': min_peak,
+            'max_peak_db': max_peak,
+            'velocity_thresholds': velocity_thresholds,
+            'velocity_distribution': {}
+        }
+
+        # Statistiky pro každou velocity
+        for vel in range(8):
+            if vel in velocity_stats:
+                peaks = velocity_stats[vel]
+                global_stats['velocity_distribution'][vel] = {
+                    'count': len(peaks),
+                    'min_peak': min(peaks),
+                    'max_peak': max(peaks),
+                    'avg_peak': np.mean(peaks)
+                }
+            else:
+                global_stats['velocity_distribution'][vel] = {
+                    'count': 0,
+                    'min_peak': None,
+                    'max_peak': None,
+                    'avg_peak': None
+                }
+
+        return global_stats, dict(midi_velocity_stats)
 
 
 class AudioSample:
-    """Container pro data audio vzorku"""
+    """Container pro data audio vzorku - rozšířený o peak detection"""
 
-    def __init__(self, filepath, waveform, sr, rms_db, midi_note, detected_pitch=None):
+    def __init__(self, filepath, waveform, sr, rms_db, midi_note, detected_pitch=None, attack_duration=0.5):
         self.filepath = filepath
         self.waveform = waveform
         self.sr = sr
         self.rms_db = rms_db
         self.midi_note = midi_note
-        self.detected_pitch = detected_pitch  # Uložená detekovaná pitch pro opětovné použití
+        self.detected_pitch = detected_pitch
         self.velocity = None
+
+        # Nové peak detection metriky
+        self.peak_db = AudioUtils.calculate_peak_db(waveform)
+        self.attack_peak_db = AudioUtils.calculate_attack_peak_db(waveform, sr, attack_duration)
 
         # Validace dat
         if not isinstance(filepath, Path):
@@ -549,15 +692,16 @@ class AudioSample:
 class PitchCorrectorWithVelocityMapping:
     """
     Hlavní třída procesoru pro korekci pitch a velocity mapping.
-    Optimalizována pro vzorky hudebních nástrojů.
+    Optimalizována pro vzorky hudebních nástrojů s globálním peak detection velocity mappingem.
     """
 
-    def __init__(self, input_dir, output_dir, grouping_threshold=1.5, verbose=False):
+    def __init__(self, input_dir, output_dir, attack_duration=0.5, verbose=False):
         self.input_dir = Path(input_dir)
         self.output_dir = Path(output_dir)
-        self.grouping_threshold = grouping_threshold
+        self.attack_duration = attack_duration
         self.verbose = verbose
         self.max_semitone_shift = 1.0  # Maximum ±1 půltón korekce
+        self.global_velocity_map = None  # Bude nastaveno v create_velocity_mappings
 
         # Validace adresářů
         if not self.input_dir.exists():
@@ -605,12 +749,8 @@ class PitchCorrectorWithVelocityMapping:
         iterator = wav_files if self.verbose else tqdm(wav_files, desc="Načítám soubory", unit="soubor")
 
         for file_path in iterator:
-            if self.verbose:
-                print(f"\n--- Zpracovávám: {file_path.name} ---")
-            else:
-                # Odřádkování před informacemi o souboru
-                tqdm.write(f"\nZpracovávám: {file_path.name}")
-
+            # Čisté formátování informací o souboru
+            self.progress_mgr.file_info(file_path.name)
             self.progress_mgr.debug(f"Čtu soubor: {file_path}")
 
             try:
@@ -675,14 +815,17 @@ class PitchCorrectorWithVelocityMapping:
                     f"Soubor {file_path.name} vyžaduje korekci {semitone_diff:.2f} půltónů (>±{self.max_semitone_shift}), zahazuji")
                 continue
 
-            # Výpočet RMS
+            # Výpočet RMS a peak hodnot
             rms_db = AudioUtils.calculate_rms_db(waveform)
             if rms_db == -np.inf:
                 self.progress_mgr.warning(f"Soubor {file_path.name} obsahuje pouze ticho, přeskakuji")
                 continue
 
             try:
-                sample = AudioSample(file_path, waveform, sr, rms_db, midi_int, detected_pitch=detected_pitch)
+                sample = AudioSample(
+                    file_path, waveform, sr, rms_db, midi_int,
+                    detected_pitch=detected_pitch, attack_duration=self.attack_duration
+                )
                 samples.append(sample)
             except ValueError as e:
                 self.progress_mgr.error(f"Chyba při vytváření vzorku pro {file_path.name}: {e}")
@@ -691,81 +834,133 @@ class PitchCorrectorWithVelocityMapping:
             note_name = AudioUtils.midi_to_note_name(midi_int)
             target_freq = AudioUtils.midi_to_freq(midi_int)
 
-            # Informace o zpracovaném souboru
+            # Informace o zpracovaném souboru s čistým formátováním
             info_lines = [
-                f""
                 f"  Pitch: {detected_pitch:.2f} Hz → MIDI {midi_int} ({note_name}, {target_freq:.2f} Hz)",
                 f"  Korekce: {semitone_diff:+.3f} půltónů",
-                f"  RMS: {rms_db:.2f} dB, SR: {sr} Hz, délka: {duration:.2f}s"
+                f"  RMS: {rms_db:.2f} dB, Attack Peak: {sample.attack_peak_db:.2f} dB",
+                f"  SR: {sr} Hz, délka: {duration:.2f}s"
             ]
 
-            for line in info_lines:
-                if self.verbose:
-                    print(line)
-                else:
-                    tqdm.write(line)
+            self.progress_mgr.file_details(info_lines)
 
         result_msg = f"Celkem načteno {len(samples)} zpracovatelných vzorků"
-        if self.verbose:
-            print(f"\n{result_msg}")
-        else:
-            tqdm.write(f"\n{result_msg}")
+        self.progress_mgr.final_summary(result_msg)
 
         return samples
 
     def create_velocity_mappings(self, samples):
-        """Fáze 2: Vytvoření velocity mappingů pro každou MIDI notu"""
-        self.progress_mgr.section("FÁZE 2: Tvorba velocity map")
+        """Fáze 2: Vytvoření globální velocity mapy ze všech vzorků"""
+        self.progress_mgr.section("FÁZE 2: Tvorba globální velocity map (ATTACK PEAK DETECTION)")
 
-        # Seskupení vzorků podle MIDI noty
+        # Sběr všech attack peak hodnot ze všech vzorků
+        all_peak_values = [sample.attack_peak_db for sample in samples]
+
+        if not all_peak_values:
+            self.progress_mgr.error("Žádné peak hodnoty pro tvorbu velocity mapy!")
+            return None
+
+        self.progress_mgr.info(f"Analyzuji {len(all_peak_values)} vzorků ze všech not")
+
+        # Vytvoření globální velocity mapy
+        velocity_thresholds, min_peak, max_peak = VelocityMapper.create_global_velocity_mapping(all_peak_values)
+
+        # Informace o globální velocity mapě
+        info_lines = [
+            f"Globální velocity mapa:",
+            f"  Celkový rozsah: {min_peak:.2f} až {max_peak:.2f} dB ({max_peak - min_peak:.2f} dB)",
+            f"  Nejslabší vzorky (vel 0): {min_peak:.2f} dB",
+            f"  Nejsilnější vzorky (vel 7): {max_peak:.2f} dB"
+        ]
+
+        for line in info_lines:
+            if self.verbose:
+                print(line)
+            else:
+                tqdm.write(line)
+
+        # Zobrazení hranic velocity
+        threshold_info = "  Velocity hranice:"
+        if self.verbose:
+            print(threshold_info)
+        else:
+            tqdm.write(threshold_info)
+
+        for i, threshold in enumerate(velocity_thresholds):
+            if i < 7:  # Zobraz pouze hranice 0-6
+                threshold_line = f"    vel{i}: {threshold:.2f} dB a výše"
+                if self.verbose:
+                    print(threshold_line)
+                else:
+                    tqdm.write(threshold_line)
+
+        # Přiřazení velocity všem vzorkům podle globální mapy
+        for sample in samples:
+            sample.velocity = VelocityMapper.assign_velocity_from_global_map(
+                sample.attack_peak_db, velocity_thresholds
+            )
+
+        # Vytvoření statistik a seskupení podle MIDI not
+        global_stats, midi_velocity_stats = VelocityMapper.create_velocity_mapping_statistics(
+            samples, velocity_thresholds, min_peak, max_peak
+        )
+
+        # Zobrazení distribuce velocity
+        distribution_info = "\nDistribuce velocity (globální):"
+        if self.verbose:
+            print(distribution_info)
+        else:
+            tqdm.write(distribution_info)
+
+        for vel in range(8):
+            vel_stats = global_stats['velocity_distribution'][vel]
+            if vel_stats['count'] > 0:
+                dist_line = f"  vel{vel}: {vel_stats['count']} vzorků ({vel_stats['min_peak']:.1f} až {vel_stats['max_peak']:.1f} dB)"
+                if self.verbose:
+                    print(dist_line)
+                else:
+                    tqdm.write(dist_line)
+
+        # Zobrazení per-nota statistik (pouze pro noty s více velocity)
+        multi_velocity_notes = []
         midi_groups = defaultdict(list)
         for sample in samples:
             midi_groups[sample.midi_note].append(sample)
 
-        velocity_mappings = {}
-
         for midi_note, midi_samples in midi_groups.items():
-            note_name = AudioUtils.midi_to_note_name(midi_note)
-            rms_values = [s.rms_db for s in midi_samples]
+            velocities = set(s.velocity for s in midi_samples)
+            if len(velocities) > 1:
+                multi_velocity_notes.append((midi_note, midi_samples, velocities))
 
-            info_lines = [
-                f"\nMIDI {midi_note} ({note_name}): {len(midi_samples)} vzorků",
-                f"  RMS rozsah: {min(rms_values):.2f} až {max(rms_values):.2f} dB"
-            ]
-
-            for line in info_lines:
-                if self.verbose:
-                    print(line)
-                else:
-                    tqdm.write(line)
-
-            # Vytvoření velocity mappingu na základě seskupování
-            velocity_map = self.velocity_mapper.create_velocity_mapping(rms_values, self.grouping_threshold)
-            velocity_mappings[midi_note] = velocity_map
-
-            # Přiřazení velocity ke vzorkům
-            for sample in midi_samples:
-                sample.velocity = None
-                for vel, rms_list in velocity_map.items():
-                    if sample.rms_db in rms_list:
-                        sample.velocity = vel
-                        break
-
-            # Zobrazení velocity mappingu
-            mapping_header = "  Velocity mapping:"
+        if multi_velocity_notes:
+            multi_vel_header = "\nNoty s více velocity úrovněmi:"
             if self.verbose:
-                print(mapping_header)
+                print(multi_vel_header)
             else:
-                tqdm.write(mapping_header)
+                tqdm.write(multi_vel_header)
 
-            for vel, rms_list in sorted(velocity_map.items()):
-                mapping_line = f"    vel{vel}: {len(rms_list)} vzorků (RMS {min(rms_list):.1f} až {max(rms_list):.1f} dB)"
+            for midi_note, midi_samples, velocities in multi_velocity_notes:
+                note_name = AudioUtils.midi_to_note_name(midi_note)
+                vel_counts = defaultdict(int)
+                for sample in midi_samples:
+                    vel_counts[sample.velocity] += 1
+
+                vel_list = [f"vel{v}:{vel_counts[v]}" for v in sorted(velocities)]
+                note_line = f"  MIDI {midi_note} ({note_name}): {', '.join(vel_list)}"
                 if self.verbose:
-                    print(mapping_line)
+                    print(note_line)
                 else:
-                    tqdm.write(mapping_line)
+                    tqdm.write(note_line)
 
-        return velocity_mappings
+        # Uložení globální velocity mapy pro použití v exportu
+        self.global_velocity_map = {
+            'thresholds': velocity_thresholds,
+            'min_peak': min_peak,
+            'max_peak': max_peak,
+            'stats': global_stats
+        }
+
+        return self.global_velocity_map
 
     def process_and_export(self, samples):
         """Fáze 3: Zpracování a export souborů"""
@@ -787,12 +982,13 @@ class PitchCorrectorWithVelocityMapping:
             midi_note = sample.midi_note
             note_name = AudioUtils.midi_to_note_name(midi_note)
 
+            # Čisté formátování informací o exportu
             if self.verbose:
                 print(f"\n--- Exportuji: {sample.filepath.name} ---")
                 print(f"MIDI {midi_note} ({note_name}) → velocity {sample.velocity}")
             else:
-                tqdm.write(f"\nExportuji: {sample.filepath.name}")
-                tqdm.write(f"  MIDI {midi_note} ({note_name}) → velocity {sample.velocity}")
+                print(f"\nExportuji: {sample.filepath.name}", flush=True)
+                print(f"  MIDI {midi_note} ({note_name}) → velocity {sample.velocity}", flush=True)
 
             # Pitch korekce
             target_freq = AudioUtils.midi_to_freq(midi_note)
@@ -810,7 +1006,7 @@ class PitchCorrectorWithVelocityMapping:
                 if self.verbose:
                     print(correction_info)
                 else:
-                    tqdm.write(correction_info)
+                    print(correction_info, flush=True)
 
                 # Aplikace jednoduchého pitch shift (mění délku)
                 tuned_waveform, tuned_sr = self.pitch_shifter.pitch_shift_simple(
@@ -824,7 +1020,7 @@ class PitchCorrectorWithVelocityMapping:
                 if self.verbose:
                     print(duration_info)
                 else:
-                    tqdm.write(duration_info)
+                    print(duration_info, flush=True)
 
             else:
                 tuned_waveform = sample.waveform
@@ -833,7 +1029,7 @@ class PitchCorrectorWithVelocityMapping:
                 if self.verbose:
                     print(no_correction_info)
                 else:
-                    tqdm.write(no_correction_info)
+                    print(no_correction_info, flush=True)
 
             # Generování výstupů pro oba cílové sample rate
             target_sample_rates = [(44100, 'f44'), (48000, 'f48')]
@@ -873,7 +1069,7 @@ class PitchCorrectorWithVelocityMapping:
                     if self.verbose:
                         print(save_info)
                     else:
-                        tqdm.write(save_info)
+                        print(save_info, flush=True)
                     self.progress_mgr.debug(f"Úspěšně zapsán: {output_path} ({len(output_waveform)} vzorků, {target_sr} Hz)")
                     total_outputs += 1
                 except Exception as e:
@@ -886,9 +1082,9 @@ class PitchCorrectorWithVelocityMapping:
         """Hlavní pipeline zpracování"""
         print(f"Vstupní adresář: {self.input_dir}")
         print(f"Výstupní adresář: {self.output_dir}")
-        print(f"Grouping threshold: {self.grouping_threshold} dB")
+        print(f"Attack duration: {self.attack_duration}s")
         print(f"Max pitch korekce: ±{self.max_semitone_shift} půltónů")
-        print(f"Pokročilá YIN detekce s oktávovou korekcí a sustain analýzou")
+        print(f"Pokročilá YIN detekce s oktávovou korekcí a globální attack peak velocity mappingem")
         print(f"Verbose režim: {'ZAPNUT' if self.verbose else 'VYPNUT'}")
 
         try:
@@ -897,8 +1093,8 @@ class PitchCorrectorWithVelocityMapping:
             if not samples:
                 return
 
-            # Fáze 2: Vytvoření velocity mappingů
-            velocity_mappings = self.create_velocity_mappings(samples)
+            # Fáze 2: Vytvoření globální velocity mapy
+            global_velocity_map = self.create_velocity_mappings(samples)
 
             # Fáze 3: Zpracování a export
             total_outputs = self.process_and_export(samples)
@@ -907,7 +1103,9 @@ class PitchCorrectorWithVelocityMapping:
             self.progress_mgr.section("DOKONČENO")
             summary_lines = [
                 f"Celkem vytvořeno {total_outputs} výstupních souborů",
-                f"Výstupní adresář: {self.output_dir}"
+                f"Výstupní adresář: {self.output_dir}",
+                f"Globální velocity mapa: {self.global_velocity_map['min_peak']:.1f} až {self.global_velocity_map['max_peak']:.1f} dB",
+                f"Použito: Attack Peak Detection ({self.attack_duration}s) s globálním velocity mappingem"
             ]
 
             for line in summary_lines:
@@ -925,22 +1123,29 @@ class PitchCorrectorWithVelocityMapping:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="""Program pro korekci pitch a velocity mapping s pokročilou YIN detekcí.
+        description="""Program pro korekci pitch a globální velocity mapping s pokročilou YIN detekcí a Attack Peak Detection.
 
         Klíčové funkce:
         - Pokročilá YIN pitch detekce s oktávovou korekcí pro extrémní frekvence
+        - Globální Attack Peak Detection velocity mapping napříč všemi notami
+        - Adaptivní škálování velocity na celý rozsah nahrávky (vel 0-7)
         - Sustain analýza pro stabilnější detekci
         - Adaptivní parametry podle vzorkovací frekvence (44.1kHz/48kHz)  
-        - Velocity mapping (0-7) podle RMS hlasitosti pro každou MIDI notu na základě seskupování podobných hodnot
         - Jednoduchý pitch shift (mění délku vzorku)
         - Dual-rate export (44.1kHz + 48kHz)
         - Maximální korekce ±1 půltón
-        - Vylepšené informování o progresu s podporou verbose režimu
+        - Vylepšené informování o progresu s čistým formátováním
 
         Optimalizováno pro vzorky hudebních nástrojů s dynamickým envelope.
+        
+        GLOBÁLNÍ VELOCITY MAPPING:
+        - Analyzuje všechny vzorky ze všech not
+        - Vytvoří jednotnou škálu od nejslabšího po nejsilnější vzorek
+        - Zajistí konzistentní velocity napříč všemi notami
+        - Automaticky se adaptuje na rozsah nahrávky
 
         Příklad použití:
-        python pitch_corrector.py --input-dir ./samples --output-dir ./output --verbose
+        python pitch_corrector.py --input-dir ./samples --output-dir ./output --verbose --attack-duration 0.5
         """,
         formatter_class=argparse.RawTextHelpFormatter
     )
@@ -949,8 +1154,8 @@ def parse_args():
                         help='Cesta k adresáři s vstupními WAV soubory')
     parser.add_argument('--output-dir', required=True,
                         help='Cesta k výstupnímu adresáři')
-    parser.add_argument('--grouping-threshold', type=float, default=1.5,
-                        help='Práh pro seskupování RMS hodnot v dB (výchozí: 1.5)')
+    parser.add_argument('--attack-duration', type=float, default=0.5,
+                        help='Délka attack fáze pro peak detection v sekundách (výchozí: 0.5)')
     parser.add_argument('--verbose', action='store_true',
                         help='Podrobný výstup pro debugging (vypne progress bary pro lepší čitelnost)')
 
@@ -960,16 +1165,16 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
 
-    print("=== PITCH CORRECTOR S POKROČILOU YIN DETEKCÍ ===")
+    print("=== PITCH CORRECTOR S GLOBÁLNÍ ATTACK PEAK VELOCITY MAPOU ===")
     print("Optimalizováno pro vzorky hudebních nástrojů")
-    print("Verze s oktávovou korekcí a sustain analýzou")
-    print("=" * 50)
+    print("Verze s oktávovou korekcí a globálním velocity mappingem")
+    print("=" * 62)
 
     try:
         corrector = PitchCorrectorWithVelocityMapping(
             input_dir=args.input_dir,
             output_dir=args.output_dir,
-            grouping_threshold=args.grouping_threshold,
+            attack_duration=args.attack_duration,
             verbose=args.verbose
         )
 

@@ -1,56 +1,61 @@
-## Popis programu
-Tento program slouží k automatické korekci pitch (výšky tónu) a mapování velocity (hlasitosti) pro vzorky hudebních nástrojů ve formátu WAV. Používá pokročilou verzi algoritmu YIN pro detekci pitch s adaptivní oktávovou korekcí a analýzou sustain fáze pro lepší přesnost. Program seskupuje vzorky podle MIDI not a RMS hlasitosti, aplikuje jednoduchý pitch shift (který mění délku vzorku) a exportuje výsledky v dvou vzorkovacích frekvencích (44.1 kHz a 48 kHz).
+# Pitch Corrector s Globálním Velocity Mappingem
 
-Klíčové funkce:
-- Detekce pitch s oktávovou korekcí pro nízké/vysoké tóny.
-- Mapování velocity (0-7) na základě seskupování RMS hodnot (max 8 vrstev).
-- Korekce na nejbližší půltón.
-- Podpora mono i stereo souborů.
-- Verbose režim pro detailní výstup.
+## Popis
+Tento program slouží k automatické korekci výšky tónu (pitch) a mapování dynamiky (velocity) u vzorků hudebních nástrojů. 
+Používá pokročilou YIN detekci pro určení výšky tónu, globální velocity mapping na základě peak detekce v attack fázi 
+a adaptivní oktávovou korekci pro extrémní frekvence. Program je optimalizován pro WAV soubory s vzorkovacími 
+frekvencemi 44.1 kHz nebo 48 kHz a exportuje upravené vzorky do dvou formátů.
 
-Program je optimalizován pro vzorky hudebních nástrojů s dynamickým envelope, ale lze ho použít i pro jiné audio vzorky.
+Klíčové vlastnosti:
 
-Autor: Refaktorovaná verze pro obecné hudební nástroje  
-Datum: 2025  
+- Detekce výšky tónu s oktávovou korekcí pro nízké/vysoké tóny.
+- Globální velocity mapping napříč všemi vzorky (0-7 úrovní) na základě attack peak detekce.
+- Pitch shifting, který mění délku vzorku pro realistický efekt.
+- Export do 44.1 kHz a 48 kHz s unikátními názvy souborů (např. `m060-vel3-f44.wav`).
+- Podpora pro mono i stereo soubory.
+- Omezení maximální korekce na ±1 půltón.
 
-## Instalace a závislosti
-Program je napsán v Pythonu 3 a vyžaduje následující knihovny. Nainstalujte je pomocí pip:
+Program probíhá ve třech fázích: načtení a analýza, tvorba velocity mapy, tuning a export.
+
+## Požadavky a Instalace
+
+- Python 3.12 nebo vyšší.
+- Závislosti: `soundfile`, `numpy`, `resampy`, `collections`, `statistics`, `pathlib`, `tqdm`, `logging`.
+
+Instalace závislostí:
 
 ```
 pip install soundfile numpy resampy tqdm
 ```
 
-Další standardní moduly (jako collections, statistics, pathlib, logging) jsou součástí Pythonu.
+Program nevyžaduje další instalaci – stačí spustit Python skript.
 
 ## Použití
-Spusťte program z příkazové řádky s povinnými argumenty pro vstupní a výstupní adresář.
 
-### Argumenty příkazové řádky
-- `--input-dir`: Cesta k adresáři s vstupními WAV soubory (povinné).
+Spusťte program z příkazového řádku s povinnými argumenty pro vstupní a výstupní adresáře.
+
+### Argumenty příkazového řádku
+
+- `--input-dir`: Cesta k adresáři se vstupními WAV soubory (povinné).
 - `--output-dir`: Cesta k výstupnímu adresáři (povinné).
-- `--grouping-threshold`: Práh pro seskupování RMS hodnot v dB (výchozí: 1.5).
-- `--verbose`: Zapne podrobný výstup (bez progress barů pro lepší čitelnost).
+- `--attack-duration`: Délka attack fáze pro peak detekci v sekundách (výchozí: 0.5).
+- `--verbose`: Zapne podrobný výstup pro ladění (vypne progress bary).
 
 ### Příklad spuštění
+
 ```
-python pitch_corrector.py --input-dir ./samples --output-dir ./output --grouping-threshold 2.0 --verbose
+python pitch_corrector.py --input-dir ./samples --output-dir ./output --attack-duration 0.5 --verbose
 ```
 
-Program prochází třemi fázemi:
-1. Načtení a analýza souborů (detekce pitch, RMS).
-2. Tvorba velocity map pro každou MIDI notu.
-3. Tuning pitch a export souborů (s unikátními názvy jako `m060-vel3-f44.wav`).
+Toto zpracuje všechny WAV soubory v `./samples`, vytvoří globální velocity mapu a uloží upravené vzorky do `./output`.
 
-Výstupní soubory mají formát: `m<MIDI>-vel<velocity>-f<sr>[-nextX].wav`, kde:
-- MIDI je číslo noty (např. 060 pro C4).
-- Velocity je 0-7 (od tichého po hlasité).
-- sr je 44 nebo 48 (pro 44.1 kHz nebo 48 kHz).
-- Pokud existuje duplicitní název, přidá se `-nextX`.
+## Výstup
 
-## Poznámky a omezení
-- Podporované vzorkovací frekvence: Pouze 44.1 kHz nebo 48 kHz.
-- Minimální délka vzorku: 0.1 s.
-- Pokud nelze detekovat pitch, vzorek se přeskočí.
-- Velocity mapping vyřadí extrémní vzorky, pokud by překročilo 8 skupin.
-- Program mění délku vzorku při pitch shiftu, což je realistické pro mnoho nástrojů (kratší vysoké tóny, delší nízké). 
-- .
+- Výstupní soubory mají formát `m<MIDI>-vel<VELOCITY>-f<SR>.wav` (např. `m060-vel3-f44.wav` pro MIDI 60, velocity 3, 44.1 kHz).
+- Pokud existuje soubor se stejným názvem, přidá se suffix `-next1`, `-next2` atd.
+- Program vypisuje průběh, statistiky velocity mapy a finální shrnutí.
+
+## Poznámky
+- Program zahazuje vzorky s nedetekovatelným pitchem, příliš velkou korekcí nebo mimo MIDI rozsah 0-127.
+- Globální velocity mapping zajišťuje konzistenci napříč všemi notami na základě celkového rozsahu nahrávky.
+- V verbose režimu je výstup detailnější pro lepší ladění, ale bez progress barů.
