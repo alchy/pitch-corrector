@@ -2,7 +2,7 @@
 Program pro korekci pitch a velocity mapping vzorků hudebních nástrojů
 s pokročilou YIN detekcí, globálním velocity mappingem a adaptivní oktávovou korekcí.
 
-Autor: Refaktorovaná verze s globálním velocity mappingem
+Autor: Refaktorovaná verze s globálním velocity mappingem a bez tqdm
 Datum: 2025
 """
 
@@ -13,7 +13,6 @@ import resampy
 from collections import defaultdict
 import statistics
 from pathlib import Path
-from tqdm import tqdm
 import logging
 import sys
 import os
@@ -22,19 +21,16 @@ import os
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-# Vypnutí progress bar při verbose režimu pro lepší čitelnost
+# Jednoduchý progress manager bez tqdm
 class ProgressManager:
-    """Správce progress barů a výstupu s vylepšeným formátováním"""
+    """Správce výstupu s vylepšeným formátováním"""
 
     def __init__(self, verbose=False):
         self.verbose = verbose
 
     def info(self, message):
         """Informační zpráva"""
-        if self.verbose:
-            print(f"[INFO] {message}")
-        else:
-            tqdm.write(f"[INFO] {message}")
+        print(f"[INFO] {message}")
 
     def debug(self, message):
         """Debug zpráva (pouze v verbose režimu)"""
@@ -43,53 +39,35 @@ class ProgressManager:
 
     def warning(self, message):
         """Varovná zpráva"""
-        if self.verbose:
-            print(f"[WARNING] {message}")
-        else:
-            tqdm.write(f"[WARNING] {message}")
+        print(f"[WARNING] {message}")
 
     def error(self, message):
         """Chybová zpráva"""
-        if self.verbose:
-            print(f"[ERROR] {message}")
-        else:
-            tqdm.write(f"[ERROR] {message}")
+        print(f"[ERROR] {message}")
 
     def section(self, title):
         """Sekce - hlavička"""
         separator = "=" * len(title)
-        if self.verbose:
-            print(f"\n{separator}")
-            print(title)
-            print(separator)
-        else:
-            tqdm.write(f"\n{separator}")
-            tqdm.write(title)
-            tqdm.write(separator)
+        print(f"\n{separator}")
+        print(title)
+        print(separator)
 
-    def file_info(self, filename):
-        """Informace o zpracovávaném souboru s čistým formátováním"""
-        if self.verbose:
-            print(f"\n--- Zpracovávám: {filename} ---")
+    def file_info(self, filename, current=None, total=None):
+        """Informace o zpracovávaném souboru"""
+        if current and total:
+            progress_str = f"[{current}/{total}]"
         else:
-            # Vynutit nový řádek a ukončit progress bar řádek
-            print(f"\nZpracovávám: {filename}", flush=True)
+            progress_str = ""
+        print(f"\n{progress_str} Zpracovávám: {filename}")
 
     def file_details(self, details_lines):
         """Detaily o souboru - seznam řádků"""
         for line in details_lines:
-            if self.verbose:
-                print(line)
-            else:
-                print(line, flush=True)  # Použij print místo tqdm.write
+            print(line)
 
     def final_summary(self, message):
-        """Finální shrnutí s čistým formátováním"""
-        if self.verbose:
-            print(f"\n{message}")
-        else:
-            print()  # Prázdný řádek
-            tqdm.write(message)
+        """Finální shrnutí"""
+        print(f"\n{message}")
 
 
 class AudioUtils:
@@ -745,20 +723,12 @@ class PitchCorrectorWithVelocityMapping:
             self.progress_mgr.error("Nebyly nalezeny žádné WAV soubory!")
             return samples
 
-        self.progress_mgr.info(f"Nalezeno {len(wav_files)} WAV souborů")
+        total_files = len(wav_files)
+        self.progress_mgr.info(f"Nalezeno {total_files} WAV souborů")
 
-        # Progress bar pro načítání souborů (vypnutý v verbose režimu)
-        iterator = wav_files if self.verbose else tqdm(wav_files, desc="Načítám soubory", unit="soubor")
-
-        for file_path in iterator:
-            # Čisté formátování informací o souboru
-            if not self.verbose:
-                # Pro tqdm progress bar - vynutit nový řádek
-                iterator.write("")  # Prázdný řádek
-                iterator.write(f"Zpracovávám: {file_path.name}")
-            else:
-                self.progress_mgr.file_info(file_path.name)
-
+        for i, file_path in enumerate(wav_files, 1):
+            # Informace o aktuálním souboru s progress
+            self.progress_mgr.file_info(file_path.name, current=i, total=total_files)
             self.progress_mgr.debug(f"Čtu soubor: {file_path}")
 
             try:
@@ -842,23 +812,17 @@ class PitchCorrectorWithVelocityMapping:
             note_name = AudioUtils.midi_to_note_name(midi_int)
             target_freq = AudioUtils.midi_to_freq(midi_int)
 
-            # Informace o zpracovaném souboru s čistým formátováním
+            # Informace o zpracovaném souboru
             info_lines = [
-                f"\n"
-                f"  Pitch: {detected_pitch:.2f} Hz → MIDI {midi_int} ({note_name}, {target_freq:.2f} Hz)",
+                f"  Pitch: {detected_pitch:.2f} Hz -> MIDI {midi_int} ({note_name}, {target_freq:.2f} Hz)",
                 f"  Korekce: {semitone_diff:+.3f} půltónů",
                 f"  RMS: {rms_db:.2f} dB, Attack Peak: {sample.attack_peak_db:.2f} dB",
                 f"  SR: {sr} Hz, délka: {duration:.2f}s"
             ]
 
-            if not self.verbose:
-                # Pro tqdm progress bar - použij iterator.write()
-                for line in info_lines:
-                    iterator.write(line)
-            else:
-                self.progress_mgr.file_details(info_lines)
+            self.progress_mgr.file_details(info_lines)
 
-        result_msg = f"Celkem načteno {len(samples)} zpracovatelných vzorků"
+        result_msg = f"Celkem načteno {len(samples)} zpracovatelných vzorků z {total_files} souborů"
         self.progress_mgr.final_summary(result_msg)
 
         return samples
@@ -888,25 +852,14 @@ class PitchCorrectorWithVelocityMapping:
         ]
 
         for line in info_lines:
-            if self.verbose:
-                print(line)
-            else:
-                tqdm.write(line)
+            print(line)
 
         # Zobrazení hranic velocity
-        threshold_info = "  Velocity hranice:"
-        if self.verbose:
-            print(threshold_info)
-        else:
-            tqdm.write(threshold_info)
+        print("  Velocity hranice:")
 
         for i, threshold in enumerate(velocity_thresholds):
             if i < 7:  # Zobraz pouze hranice 0-6
-                threshold_line = f"    vel{i}: {threshold:.2f} dB a výše"
-                if self.verbose:
-                    print(threshold_line)
-                else:
-                    tqdm.write(threshold_line)
+                print(f"    vel{i}: {threshold:.2f} dB a výše")
 
         # Přiřazení velocity všem vzorkům podle globální mapy
         for sample in samples:
@@ -920,20 +873,12 @@ class PitchCorrectorWithVelocityMapping:
         )
 
         # Zobrazení distribuce velocity
-        distribution_info = "\nDistribuce velocity (globální):"
-        if self.verbose:
-            print(distribution_info)
-        else:
-            tqdm.write(distribution_info)
+        print("\nDistribuce velocity (globální):")
 
         for vel in range(8):
             vel_stats = global_stats['velocity_distribution'][vel]
             if vel_stats['count'] > 0:
-                dist_line = f"  vel{vel}: {vel_stats['count']} vzorků ({vel_stats['min_peak']:.1f} až {vel_stats['max_peak']:.1f} dB)"
-                if self.verbose:
-                    print(dist_line)
-                else:
-                    tqdm.write(dist_line)
+                print(f"  vel{vel}: {vel_stats['count']} vzorků ({vel_stats['min_peak']:.1f} až {vel_stats['max_peak']:.1f} dB)")
 
         # Zobrazení per-nota statistik (pouze pro noty s více velocity)
         multi_velocity_notes = []
@@ -947,11 +892,7 @@ class PitchCorrectorWithVelocityMapping:
                 multi_velocity_notes.append((midi_note, midi_samples, velocities))
 
         if multi_velocity_notes:
-            multi_vel_header = "\nNoty s více velocity úrovněmi:"
-            if self.verbose:
-                print(multi_vel_header)
-            else:
-                tqdm.write(multi_vel_header)
+            print("\nNoty s více velocity úrovněmi:")
 
             for midi_note, midi_samples, velocities in multi_velocity_notes:
                 note_name = AudioUtils.midi_to_note_name(midi_note)
@@ -960,11 +901,7 @@ class PitchCorrectorWithVelocityMapping:
                     vel_counts[sample.velocity] += 1
 
                 vel_list = [f"vel{v}:{vel_counts[v]}" for v in sorted(velocities)]
-                note_line = f"  MIDI {midi_note} ({note_name}): {', '.join(vel_list)}"
-                if self.verbose:
-                    print(note_line)
-                else:
-                    tqdm.write(note_line)
+                print(f"  MIDI {midi_note} ({note_name}): {', '.join(vel_list)}")
 
         # Uložení globální velocity mapy pro použití v exportu
         self.global_velocity_map = {
@@ -987,24 +924,16 @@ class PitchCorrectorWithVelocityMapping:
             self.progress_mgr.error("Žádné vzorky k exportu!")
             return 0
 
-        self.progress_mgr.info(f"Exportuji {len(valid_samples)} vzorků")
+        total_samples = len(valid_samples)
+        self.progress_mgr.info(f"Exportuji {total_samples} vzorků")
 
-        # Progress bar pro zpracování vzorků (vypnutý v verbose režimu)
-        iterator = valid_samples if self.verbose else tqdm(valid_samples, desc="Exportuji vzorky", unit="vzorek")
-
-        for sample in iterator:
+        for i, sample in enumerate(valid_samples, 1):
             midi_note = sample.midi_note
             note_name = AudioUtils.midi_to_note_name(midi_note)
 
-            # Čisté formátování informací o exportu
-            if not self.verbose:
-                # Pro tqdm progress bar - použij iterator.write()
-                iterator.write("")  # Prázdný řádek
-                iterator.write(f"Exportuji: {sample.filepath.name}")
-                iterator.write(f"  MIDI {midi_note} ({note_name}) → velocity {sample.velocity}")
-            else:
-                print(f"\n--- Exportuji: {sample.filepath.name} ---")
-                print(f"MIDI {midi_note} ({note_name}) → velocity {sample.velocity}")
+            # Informace o exportu s progress
+            print(f"\n[{i}/{total_samples}] Exportuji: {sample.filepath.name}")
+            print(f"  MIDI {midi_note} ({note_name}) -> velocity {sample.velocity}")
 
             # Pitch korekce
             target_freq = AudioUtils.midi_to_freq(midi_note)
@@ -1018,24 +947,22 @@ class PitchCorrectorWithVelocityMapping:
                     self.progress_mgr.warning(f"Korekce {semitone_shift:.3f} půltónů překračuje limit, přeskakuji")
                     continue
 
-                correction_info = f"  Pitch korekce: {detected_pitch:.2f} Hz → {target_freq:.2f} Hz ({semitone_shift:+.3f} půltónů)"
-                duration_info = f"  Délka: {original_duration:.3f}s → {new_duration:.3f}s"
+                # Aplikace jednoduchého pitch shift (mění délku)
+                tuned_waveform, tuned_sr = self.pitch_shifter.pitch_shift_simple(
+                    sample.waveform, sample.sr, semitone_shift
+                )
 
-                if not self.verbose:
-                    iterator.write(correction_info)
-                    iterator.write(duration_info)
-                else:
-                    print(correction_info)
-                    print(duration_info)
+                # Výpočet nové délky
+                original_duration = len(sample.waveform) / sample.sr
+                new_duration = len(tuned_waveform) / tuned_sr
+
+                print(f"  Pitch korekce: {detected_pitch:.2f} Hz -> {target_freq:.2f} Hz ({semitone_shift:+.3f} půltónů)")
+                print(f"  Délka: {original_duration:.3f}s -> {new_duration:.3f}s")
 
             else:
                 tuned_waveform = sample.waveform
                 tuned_sr = sample.sr
-                no_correction_info = "  Bez pitch korekce (detekce selhala)"
-                if not self.verbose:
-                    iterator.write(no_correction_info)
-                else:
-                    print(no_correction_info)
+                print("  Bez pitch korekce (detekce selhala)")
 
             # Generování výstupů pro oba cílové sample rate
             target_sample_rates = [(44100, 'f44'), (48000, 'f48')]
@@ -1071,11 +998,7 @@ class PitchCorrectorWithVelocityMapping:
                 # Uložení souboru
                 try:
                     sf.write(str(output_path), output_waveform, target_sr)
-                    save_info = f"  Uložen: {output_path.name}"
-                    if not self.verbose:
-                        iterator.write(save_info)
-                    else:
-                        print(save_info)
+                    print(f"  Uložen: {output_path.name}")
                     self.progress_mgr.debug(f"Úspěšně zapsán: {output_path} ({len(output_waveform)} vzorků, {target_sr} Hz)")
                     total_outputs += 1
                 except Exception as e:
@@ -1115,10 +1038,7 @@ class PitchCorrectorWithVelocityMapping:
             ]
 
             for line in summary_lines:
-                if self.verbose:
-                    print(line)
-                else:
-                    tqdm.write(line)
+                print(line)
 
         except KeyboardInterrupt:
             self.progress_mgr.error("Zpracování přerušeno uživatelem")
@@ -1140,7 +1060,7 @@ def parse_args():
         - Jednoduchý pitch shift (mění délku vzorku)
         - Dual-rate export (44.1kHz + 48kHz)
         - Maximální korekce ±1 půltón
-        - Vylepšené informování o progresu s čistým formátováním
+        - Vylepšené informování o progresu bez tqdm závislostí
 
         Optimalizováno pro vzorky hudebních nástrojů s dynamickým envelope.
         
@@ -1163,7 +1083,7 @@ def parse_args():
     parser.add_argument('--attack-duration', type=float, default=0.5,
                         help='Délka attack fáze pro peak detection v sekundách (výchozí: 0.5)')
     parser.add_argument('--verbose', action='store_true',
-                        help='Podrobný výstup pro debugging (vypne progress bary pro lepší čitelnost)')
+                        help='Podrobný výstup pro debugging')
 
     return parser.parse_args()
 
