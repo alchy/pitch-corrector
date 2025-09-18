@@ -693,6 +693,7 @@ class PitchCorrectorWithVelocityMapping:
 
             # Informace o zpracovaném souboru
             info_lines = [
+                f""
                 f"  Pitch: {detected_pitch:.2f} Hz → MIDI {midi_int} ({note_name}, {target_freq:.2f} Hz)",
                 f"  Korekce: {semitone_diff:+.3f} půltónů",
                 f"  RMS: {rms_db:.2f} dB, SR: {sr} Hz, délka: {duration:.2f}s"
