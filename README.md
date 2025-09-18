@@ -1,142 +1,59 @@
-# Pitch Corrector
+# README.md pro Program Korekce Pitch a Velocity Mapping
 
-Program pro automatickou korekci ladění (pitch) WAV souborů na standardní hudební ladění (A4 = 440 Hz). Nástroj detekuje fundamentální frekvenci vstupních audio souborů, identifikuje nejbližší MIDI notu a upravuje ladění tak, aby odpovídalo přesně této notě.
+## Popis
+Tento Python program slouží k automatické korekci pitch (tónové výšky) a mapování velocity (hlasitosti) pro vzorky hudebních nástrojů. Používá pokročilou verzi YIN algoritmu pro detekci pitch s adaptivní oktávovou korekcí a analýzou sustain fáze. Program zpracovává WAV soubory, odstraňuje outliery, vytváří velocity vrstvy (0-7) na základě RMS hlasitosti a exportuje korigované vzorky v 44.1 kHz a 48 kHz formátech.
 
-## Funkce
+Klíčové funkce:
+- Detekce pitch s oktávovou korekcí pro nízké/vysoké tóny.
+- Velocity mapping pro každou MIDI notu.
+- Jednoduchý pitch shift (mění délku vzorku pro realističnost).
+- Omezení maximální korekce na ±1 půltón.
+- Podpora stereo souborů a automatická normalizace.
 
-- **Automatická detekce pitch**: Pokročilá detekce fundamentální frekvence s více metodami pro maximální přesnost
-- **Podpora stereo i mono**: Zpracovává jak stereo, tak mono WAV soubory
-- **Rozsah klavíru**: Optimalizováno pro detekci not v rozsahu klavíru (A0 - C8, 27.5 Hz - 4186 Hz)
-- **Zachování kvality**: Zachovává původní hlasitost a kvalitu zvuku
-- **Inteligentní naming**: Výstupní soubory jsou pojmenovány podle MIDI čísla, noty a hlasitosti
-- **Paměťová optimalizace**: Volitelná podpora librosa pro efektivnější práci s pamětí
+Program je optimalizován pro vzorky hudebních nástrojů s dynamickým envelope. Vstupní soubory musí mít vzorkovací frekvenci 44.1 kHz nebo 48 kHz.
 
 ## Požadavky
+- Python 3.8+
+- Knihovny: `numpy`, `soundfile`, `resampy`, `scipy` (pro některé funkce, i když není explicitně importován), `argparse`, `collections`, `statistics`, `pathlib`.
 
-### Základní požadavky
+Instalace knihoven:
 ```
-torch
-torchaudio
-numpy
-```
-
-### Doporučené (pro lepší výkon)
-```
-librosa
-resampy
-```
-
-## Instalace
-
-1. Naklonujte repository:
-```bash
-git clone <repository-url>
-cd pitch-corrector
-```
-
-2. Nainstalujte základní závislosti:
-```bash
-pip install torch torchaudio numpy
-```
-
-3. (Doporučeno) Nainstalujte librosa pro lepší paměťovou efektivitu:
-```bash
-pip install librosa resampy
+pip install numpy soundfile resampy
 ```
 
 ## Použití
+Spusťte program přes příkazový řádek s následujícími argumenty:
 
-### Základní použití
-```bash
-python pitch_corrector.py --input-dir ./vstupni_soubory --output-dir ./vystupni_soubory
+- `--input-dir`: Cesta k adresáři s vstupními WAV soubory (povinný).
+- `--output-dir`: Cesta k výstupnímu adresáři (povinný).
+- `--outlier-threshold`: Práh pro odstranění outlierů v dB (výchozí: 8.0).
+- `--verbose`: Zapne podrobný výstup pro ladění pitch detekce.
+
+Příklad:
+```
+python pitch_corrector.py --input-dir ./samples --output-dir ./output --verbose
 ```
 
-### Parametry
+Výstupní soubory mají formát: `m<MIDI>-vel<VELOCITY>-f44.wav` nebo `f48.wav`, s případným příponou `-nextN` pro unikátnost.
 
-- `--input-dir` (povinný): Cesta k adresáři obsahujícímu vstupní WAV soubory
-- `--output-dir` (povinný): Cesta k adresáři pro uložení opravených souborů
+## Proces zpracování
+1. **Načtení a analýza**: Program načte všechny WAV soubory z vstupního adresáře, pro každý soubor provede pokročilou detekci pitch pomocí YIN algoritmu (s adaptivní oktávovou korekcí a výběrem sustain sekce pro stabilnější výsledky), vypočítá odpovídající MIDI notu (s kontrolou maximální odchylky ±1 půltón), určí RMS hlasitost (pro pozdější velocity mapping) a uloží tyto data do interních struktur pro další fáze. Pokud pitch nelze detekovat nebo je odchylka příliš velká, soubor je přeskočen.
 
-### Příklady
+2. **Velocity mapping**: Vzorky jsou seskupeny podle MIDI not (každá nota zpracována samostatně), pro každou skupinu se vypočítají RMS hodnoty, odstraní se outliery na základě mediánové odchylky (s nastavitelným prahem), a poté se RMS hodnoty lineárně mapují do velocity vrstev 0-7 (od nejtišší po nejsilnější). Každému vzorku je přiřazena odpovídající velocity; outliery jsou vyřazeny z dalšího zpracování.
 
-1. **Zpracování adresáře s audio soubory:**
-```bash
-python pitch-corrector.py --input-dir ./samples_in --output-dir ./samples_out_tuned
-```
+3. **Tuning a export**: Pro každý platný vzorek se znovu potvrdí pitch, aplikuje se jednoduchý pitch shift (pomocí resamplingu, což mění délku vzorku pro přirozený efekt), normalizuje se audio, konvertuje se do cílových vzorkovacích frekvencí (44.1 kHz a 48 kHz) a uloží se do výstupního adresáře s unikátním názvem obsahujícím MIDI, velocity a frekvenci. Proces zahrnuje chybovou kontrolu při ukládání.
 
-2. **Zobrazení nápovědy:**
-```bash
-python pitch_corrector.py --help
-```
+## Omezení
+- Podporuje pouze WAV soubory s 44.1/48 kHz.
+- Žádná podpora pro instalaci dodatečných balíčků (používá vestavěné knihovny).
+- Maximální korekce ±1 půltón – větší odchylky jsou zahazovány.
 
-## Formát vstupních souborů
+## Autor a verze
+- Autor: Refaktorovaná verze pro obecné hudební nástroje.
+- Datum: 2025.
 
-Program akceptuje WAV soubory s následujícími parametry:
-- **Formát**: WAV (mono nebo stereo)
-- **Vzorkovací frekvence**: 44.1 kHz
-- **Maximální délka**: 12 sekund
-- **Frekvence**: Rozsah klavíru (A0 - C8, ~27.5 Hz - 4186 Hz)
-
-## Formát výstupních souborů
-
-Opravené soubory jsou uloženy s názvem ve formátu:
-```
-mXXX-NOTA-DbLvl±XX.wav
-```
-
-Kde:
-- `XXX` = MIDI číslo noty (např. `060` pro C4)
-- `NOTA` = Název noty s oktávou (např. `C4`, `F#3`)
-- `±XX` = Hlasitost v dB (např. `-023`, `+005`)
-
-### Příklady názvů souborů:
-- `m060-C4-DbLvl-023.wav` - střední C, hlasitost -23 dB
-- `m069-A4-DbLvl-018.wav` - A4 (440 Hz), hlasitost -18 dB
-- `m072-C5-DbLvl+002.wav` - C5, hlasitost +2 dB
-
-## Algoritmus detekce pitch
-
-Program používá tři metody detekce pro maximální přesnost:
-
-1. **Torchaudio detector**: Vestavěný detektor PyTorch/torchaudio
-2. **Librosa piptrack**: Pokročilá detekce s analýzou harmonických (pokud je k dispozici)
-3. **Autokorelace**: Záložní metoda založená na autokorelační analýze
-
-### Preprocessing
-- Konverze na mono (průměrování kanálů u stereo)
-- Normalizace na konzistentní úroveň (-20 dB)
-- High-pass filtr pro odstranění nízkofrekvenčního šumu
-
-## Výstup programu
-
-Program zobrazuje podrobné informace o zpracování:
-
-```
-Používám zařízení: cpu
-Zpracovávám sample001.wav
-Formát: stereo
-Detekovaná frekvence: 261.63 Hz
-MIDI: 60.00 -> 60, posun: 0.000 půltónů
-Žádný pitch shift není potřeba
-Zpracováno: sample001.wav -> m060-C4-DbLvl-023.wav, pitch: 261.63 Hz -> 261.63 Hz, stereo
---------------------------------------------------
-```
-
-## Řešení problémů
-
-### Chybové hlášky
-
-**"Librosa nebo resampy není k dispozici"**
-- Program bude pokračovat s torchaudio, ale doporučuje se instalace librosa pro lepší výkon
-- Řešení: `pip install librosa resampy`
-
-**"Soubor má neplatnou vzorkovací frekvenci"**
-- Soubor nemá 44.1 kHz vzorkovací frekvenci
-- Řešení: Převeďte soubor na 44.1 kHz pomocí audio editoru
-
-**"Soubor je delší než 12 sekund"**
-- Program nepodporuje dlouhé soubory z důvodu paměťových limitů
-- Řešení: Rozdělte soubor na kratší segmenty
-
-**"Nelze detekovat platnou frekvenci"**
-- Audio neobsahuje jasně definovanou fundamentální frekvenci nebo je mimo rozsah klavíru
-- Řešení: Ověřte kvalitu nahrávky a přítomnost tónu
+## Poznámky k programu
+Při kontrole programu jsem nenašel zásadní nedostatky – je dobře strukturovaný, s komentáři a error handlingem. Menší návrhy na zlepšení:
+- Uložení detected_pitch do AudioSample by ušetřilo re-detekci v fázi 3.
+- Přidání podpory pro více formátů (např. FLAC) by bylo užitečné, ale není vyžadováno.
+- V verbose módu by mohlo být více logů o oktávových korekcích. Pokud chceš tyto změny implementovat, navrhnu je nejdříve.
