@@ -217,15 +217,17 @@ class AdvancedYINDetector:
         """Aktualizuje YIN parametry podle vzorkovací frekvence"""
         self.sample_rate = sample_rate
 
-        # Adaptivní velikosti oken podle sample rate
+        # Adaptivní velikosti oken podle sample rate pro přesnější pitch detekci
         if sample_rate >= 48000:
-            self.frame_length = 2048  # ~43ms při 48kHz
-            self.hop_size = 512  # ~11ms při 48kHz
+            self.frame_length = 4096  # ~85ms při 48kHz - delší okno pro nízké frekvence
+            self.hop_size = 1024  # ~21ms při 48kHz
+            self.threshold = 0.15  # Mírnější threshold pro 48kHz
         else:  # 44100 Hz
-            self.frame_length = 2048  # ~46ms při 44.1kHz
-            self.hop_size = 512  # ~12ms při 44.1kHz
+            self.frame_length = 4096  # ~93ms při 44.1kHz - delší okno pro nízké frekvence
+            self.hop_size = 1024  # ~23ms při 44.1kHz
+            self.threshold = 0.1  # Standardní threshold pro 44.1kHz
 
-        self.progress_mgr.debug(f"YIN parametry pro {sample_rate}Hz: frame={self.frame_length}, hop={self.hop_size}")
+        self.progress_mgr.debug(f"YIN parametry pro {sample_rate}Hz: frame={self.frame_length}, hop={self.hop_size}, threshold={self.threshold}")
 
     def find_sustain_section(self, waveform, sustain_ratio=0.6):
         """
@@ -750,7 +752,13 @@ class PitchCorrectorWithVelocityMapping:
 
         for file_path in iterator:
             # Čisté formátování informací o souboru
-            self.progress_mgr.file_info(file_path.name)
+            if not self.verbose:
+                # Pro tqdm progress bar - vynutit nový řádek
+                iterator.write("")  # Prázdný řádek
+                iterator.write(f"Zpracovávám: {file_path.name}")
+            else:
+                self.progress_mgr.file_info(file_path.name)
+
             self.progress_mgr.debug(f"Čtu soubor: {file_path}")
 
             try:
@@ -836,13 +844,19 @@ class PitchCorrectorWithVelocityMapping:
 
             # Informace o zpracovaném souboru s čistým formátováním
             info_lines = [
+                f"  "
                 f"  Pitch: {detected_pitch:.2f} Hz → MIDI {midi_int} ({note_name}, {target_freq:.2f} Hz)",
                 f"  Korekce: {semitone_diff:+.3f} půltónů",
                 f"  RMS: {rms_db:.2f} dB, Attack Peak: {sample.attack_peak_db:.2f} dB",
                 f"  SR: {sr} Hz, délka: {duration:.2f}s"
             ]
 
-            self.progress_mgr.file_details(info_lines)
+            if not self.verbose:
+                # Pro tqdm progress bar - použij iterator.write()
+                for line in info_lines:
+                    iterator.write(line)
+            else:
+                self.progress_mgr.file_details(info_lines)
 
         result_msg = f"Celkem načteno {len(samples)} zpracovatelných vzorků"
         self.progress_mgr.final_summary(result_msg)
@@ -983,12 +997,14 @@ class PitchCorrectorWithVelocityMapping:
             note_name = AudioUtils.midi_to_note_name(midi_note)
 
             # Čisté formátování informací o exportu
-            if self.verbose:
+            if not self.verbose:
+                # Pro tqdm progress bar - použij iterator.write()
+                iterator.write("")  # Prázdný řádek
+                iterator.write(f"Exportuji: {sample.filepath.name}")
+                iterator.write(f"  MIDI {midi_note} ({note_name}) → velocity {sample.velocity}")
+            else:
                 print(f"\n--- Exportuji: {sample.filepath.name} ---")
                 print(f"MIDI {midi_note} ({note_name}) → velocity {sample.velocity}")
-            else:
-                print(f"\nExportuji: {sample.filepath.name}", flush=True)
-                print(f"  MIDI {midi_note} ({note_name}) → velocity {sample.velocity}", flush=True)
 
             # Pitch korekce
             target_freq = AudioUtils.midi_to_freq(midi_note)
@@ -1003,33 +1019,23 @@ class PitchCorrectorWithVelocityMapping:
                     continue
 
                 correction_info = f"  Pitch korekce: {detected_pitch:.2f} Hz → {target_freq:.2f} Hz ({semitone_shift:+.3f} půltónů)"
-                if self.verbose:
-                    print(correction_info)
-                else:
-                    print(correction_info, flush=True)
-
-                # Aplikace jednoduchého pitch shift (mění délku)
-                tuned_waveform, tuned_sr = self.pitch_shifter.pitch_shift_simple(
-                    sample.waveform, sample.sr, semitone_shift
-                )
-
-                # Výpočet nové délky
-                original_duration = len(sample.waveform) / sample.sr
-                new_duration = len(tuned_waveform) / tuned_sr
                 duration_info = f"  Délka: {original_duration:.3f}s → {new_duration:.3f}s"
-                if self.verbose:
-                    print(duration_info)
+
+                if not self.verbose:
+                    iterator.write(correction_info)
+                    iterator.write(duration_info)
                 else:
-                    print(duration_info, flush=True)
+                    print(correction_info)
+                    print(duration_info)
 
             else:
                 tuned_waveform = sample.waveform
                 tuned_sr = sample.sr
                 no_correction_info = "  Bez pitch korekce (detekce selhala)"
-                if self.verbose:
-                    print(no_correction_info)
+                if not self.verbose:
+                    iterator.write(no_correction_info)
                 else:
-                    print(no_correction_info, flush=True)
+                    print(no_correction_info)
 
             # Generování výstupů pro oba cílové sample rate
             target_sample_rates = [(44100, 'f44'), (48000, 'f48')]
@@ -1066,10 +1072,10 @@ class PitchCorrectorWithVelocityMapping:
                 try:
                     sf.write(str(output_path), output_waveform, target_sr)
                     save_info = f"  Uložen: {output_path.name}"
-                    if self.verbose:
-                        print(save_info)
+                    if not self.verbose:
+                        iterator.write(save_info)
                     else:
-                        print(save_info, flush=True)
+                        print(save_info)
                     self.progress_mgr.debug(f"Úspěšně zapsán: {output_path} ({len(output_waveform)} vzorků, {target_sr} Hz)")
                     total_outputs += 1
                 except Exception as e:
